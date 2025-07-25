@@ -1,0 +1,10 @@
+# Ignorar ambiente virtual do Python
+.venv/
+
+# Ignorar subdiretório de configs ou SDK
+aws/
+
+# Ignorar arquivos de dados e logs
+*.csv
+*.log
+
