@@ -2,7 +2,7 @@
 import boto3
 import csv
 import logging
-from datetime import datetime, timedelta 
+from datetime import datetime, timedelta
 import pandas as pd
 from tabulate import tabulate
 
@@ -36,7 +36,7 @@ def get_all_aws_regions(service_name, logger, start_region='us-east-1'):
         client = boto3.client(service_name, region_name=start_region)
         if service_name == 'lightsail':
             return [region['name'] for region in client.get_regions()['regions']]
-        else:
+        else: # ec2 e rds
             return [region['RegionName'] for region in client.describe_regions()['Regions']]
     except Exception as e:
         logger.error(f"Erro ao obter lista de regiões para {service_name}: {e}")
@@ -63,7 +63,6 @@ def write_to_excel(filename, sheets_data, logger):
             for sheet_name, data_info in sheets_data.items():
                 if data_info['data']:
                     df = pd.DataFrame(data_info['data'])
-                    # Garante que a ordem das colunas no Excel seja a mesma dos headers
                     df = df[data_info['headers']] 
                     df.to_excel(writer, sheet_name=sheet_name, index=False)
                 else:
@@ -72,6 +71,21 @@ def write_to_excel(filename, sheets_data, logger):
     except Exception as e:
         logger.error(f"Erro ao escrever o arquivo Excel {filename}: {e}")
 
+def format_tags(tags_list):
+    """Formata uma lista de dicionários de tags em uma string única,
+       aceitando chaves em maiúsculo (Key/Value) ou minúsculo (key/value)."""
+    if not tags_list:
+        return 'N/A'
+    
+    formatted_tags = []
+    for tag in tags_list:
+        # Procura por 'Key' ou 'key' e 'Value' ou 'value'
+        key = tag.get('Key', tag.get('key'))
+        value = tag.get('Value', tag.get('value'))
+        if key is not None: # Garante que a tag tem uma chave
+            formatted_tags.append(f"{key}={value}")
+            
+    return "; ".join(formatted_tags) if formatted_tags else 'N/A'
 
 # --- 3. FUNÇÕES DOS PILARES ---
 
@@ -84,7 +98,7 @@ def gerar_relatorio_1_computacao(ec2_regions, lightsail_regions, logger):
     headers = [
         'Service', 'Region', 'Tag:Owner', 'Tag:Name', 'InstanceId', 'State', 
         'InstanceType', 'LaunchTime', 'PublicIpAddress', 'PrivateIpAddresses', 'Ipv6Addresses', 'IpType', 
-        'BackupEnabled', 'IsSsmManaged'
+        'BackupEnabled', 'IsSsmManaged', 'Tags'
     ]
     
     sts = boto3.client('sts')
@@ -113,6 +127,10 @@ def gerar_relatorio_1_computacao(ec2_regions, lightsail_regions, logger):
                     for ni in instance.get('NetworkInterfaces', []):
                         ipv6_ips.extend([ipv6['Ipv6Address'] for ipv6 in ni.get('Ipv6Addresses', [])])
 
+                    tags_list = instance.get('Tags', [])
+                    tags_str = format_tags(tags_list)
+                    instance_name = next((tag['Value'] for tag in tags_list if tag['Key'] == 'Name'), 'N/A')
+
                     inventario.append({
                         'Service': 'EC2',
                         'Region': region,
@@ -127,7 +145,8 @@ def gerar_relatorio_1_computacao(ec2_regions, lightsail_regions, logger):
                         'Ipv6Addresses': ", ".join(filter(None, ipv6_ips)),
                         'IpType': "Elastic" if instance.get('AssociationId') else "Dynamic",
                         'BackupEnabled': 'Yes' if f'arn:aws:ec2:{region}:{account_id}:instance/{inst_id}' in backup_protected_arns else 'No',
-                        'IsSsmManaged': 'Yes' if inst_id in ssm_managed_ids else 'No'
+                        'IsSsmManaged': 'Yes' if inst_id in ssm_managed_ids else 'No',
+                        'Tags': tags_str
                     })
         except Exception as e:
             logger.error(f"     (Acesso negado ou erro em EC2 {region}: {str(e)[:100]})")
@@ -141,6 +160,7 @@ def gerar_relatorio_1_computacao(ec2_regions, lightsail_regions, logger):
             ips_estaticos_map = {ip['attachedTo']: ip['name'] for ip in lightsail.get_static_ips().get('staticIps', []) if ip.get('isAttached')}
             for instance in lightsail.get_instances().get('instances', []):
                 nome_instancia = instance['name']
+                tags_str = format_tags(instance.get('tags', []))
                 inventario.append({
                     'Service': 'Lightsail',
                     'Region': region,
@@ -155,7 +175,8 @@ def gerar_relatorio_1_computacao(ec2_regions, lightsail_regions, logger):
                     'Ipv6Addresses': ", ".join(instance.get('ipv6Addresses', [])),
                     'IpType': "Static" if nome_instancia in ips_estaticos_map else "Dynamic",
                     'BackupEnabled': 'Yes' if instance.get('hasAutomaticSnapshots') else 'No',
-                    'IsSsmManaged': 'N/A'
+                    'IsSsmManaged': 'N/A',
+                    'Tags': tags_str
                 })
         except Exception as e:
             logger.error(f"     (Acesso negado ou erro em Lightsail {region}: {str(e)[:100]})")
@@ -171,13 +192,13 @@ def gerar_relatorio_2_seguranca(ec2_regions, logger):
     # Relatório de Firewalls Abertos
     logger.info("  -> Verificando Firewalls Abertos...")
     firewalls_abertos = []
-    headers_fw = ['Region', 'InstanceId', 'Tag:Name', 'SecurityGroupId', 'OffendingRule(Port)', 'OffendingRule(Source)']
+    # << CORREÇÃO >>: Cabeçalho ajustado para corresponder aos dados.
+    headers_fw = ['Region', 'InstanceId', 'InstanceName', 'SecurityGroupId', 'OffendingRule', 'Source', 'InstanceTags']
     for region in ec2_regions:
         logger.info(f"  -> Verificando Firewalls e Instâncias em {region}...")
         try:
             ec2 = boto3.client('ec2', region_name=region)
             
-            # Mapeia todos os security groups da região para suas regras abertas
             regras_abertas_map = {}
             for sg in ec2.describe_security_groups()['SecurityGroups']:
                 regras_inseguras = []
@@ -191,30 +212,32 @@ def gerar_relatorio_2_seguranca(ec2_regions, logger):
             if not regras_abertas_map:
                 continue
 
-            # Itera sobre as instâncias e verifica se usam os SGs inseguros
             for reservation in ec2.describe_instances()['Reservations']:
                 for instance in reservation['Instances']:
-                    tags = {tag['Key']: tag['Value'] for tag in instance.get('Tags', [])}
+                    instance_tags = instance.get('Tags', [])
+                    instance_name = next((tag['Value'] for tag in instance_tags if tag['Key'] == 'Name'), 'N/A')
                     for sg_anexado in instance.get('SecurityGroups', []):
                         sg_id = sg_anexado['GroupId']
                         if sg_id in regras_abertas_map:
                             for regra in regras_abertas_map[sg_id]:
+                                # << CORREÇÃO >>: Chaves do dicionário agora correspondem ao cabeçalho.
                                 firewalls_abertos.append({
                                     'Region': region,
                                     'InstanceId': instance['InstanceId'],
-                                    'Tag:Name': tags.get('Name', 'N/A'),
+                                    'InstanceName': instance_name,
                                     'SecurityGroupId': sg_id,
-                                    'OffendingRule(Port)': regra,
-                                    'OffendingRule(Source)': '0.0.0.0/0'
+                                    'OffendingRule': regra,
+                                    'Source': '0.0.0.0/0',
+                                    'InstanceTags': format_tags(instance_tags)
                                 })
         except Exception as e:
             logger.error(f"     (Acesso negado ou erro em {region}: {str(e)[:100]})")
             continue
 
-    # Relatório de Usuários IAM
+    # Relatório de Usuários IAM (sem alterações nesta parte)
     logger.info("  -> Verificando usuários IAM...")
     usuarios_iam = []
-    headers_iam = ['UserName', 'MfaEnabled', 'ConsoleAccess', 'CreateDate', 'PasswordLastUsed (GMT -03:00)']
+    headers_iam = ['UserName', 'MfaEnabled', 'ConsoleAccess', 'CreateDate', 'PasswordLastUsed (GMT -03:00)', 'Tags']
     
     try:
         iam = boto3.client('iam')
@@ -228,11 +251,9 @@ def gerar_relatorio_2_seguranca(ec2_regions, logger):
             except iam.exceptions.NoSuchEntityException:
                 console_access = 'No'
             
-            # Lógica para converter o fuso horário
             password_last_used_utc = user_detail.get('PasswordLastUsed')
             password_last_used_str = 'N/A'
             if password_last_used_utc:
-                # Converte de UTC para GMT-3 subtraindo 3 horas
                 password_last_used_gmt3 = password_last_used_utc - timedelta(hours=3)
                 password_last_used_str = password_last_used_gmt3.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -241,7 +262,8 @@ def gerar_relatorio_2_seguranca(ec2_regions, logger):
                 'MfaEnabled': 'Yes' if mfa_devices else 'No',
                 'ConsoleAccess': console_access,
                 'CreateDate': user_detail['CreateDate'].strftime("%Y-%m-%d"),
-                'PasswordLastUsed (GMT -03:00)': password_last_used_str
+                'PasswordLastUsed (GMT -03:00)': password_last_used_str,
+                'Tags': format_tags(user_detail.get('Tags', []))
             })
     except Exception as e:
         logger.error(f"     Erro ao verificar usuários IAM: {e}")
@@ -250,33 +272,39 @@ def gerar_relatorio_2_seguranca(ec2_regions, logger):
     return (firewalls_abertos, headers_fw), (usuarios_iam, headers_iam)
 
 def gerar_relatorio_3_custos(ec2_regions, logger):
-    """Coleta dados de otimização de custos e os retorna."""
+    """Coleta dados de otimização de custos para recursos órfãos, incluindo suas tags."""
     logger.info("--- 3: OTIMIZAÇÃO DE CUSTOS ---")
     recursos_orfãos = []
-    headers = ['ResourceType', 'Region', 'ResourceId', 'Details', 'CreateDate']
+    headers = ['ResourceType', 'Region', 'ResourceId', 'Details', 'CreateDate', 'Tags']
     
     for region in ec2_regions:
         logger.info(f"  -> Verificando Recursos Órfãos em {region}...")
         try:
             ec2 = boto3.client('ec2', region_name=region)
             
+            # Volumes EBS desanexados
             for vol in ec2.describe_volumes(Filters=[{'Name': 'status', 'Values': ['available']}])['Volumes']:
+                tags_str = format_tags(vol.get('Tags', []))
                 recursos_orfãos.append({
                     'ResourceType': 'EBS Volume',
                     'Region': region,
                     'ResourceId': vol['VolumeId'],
                     'Details': f"{vol['Size']} GB / {vol['VolumeType']}",
-                    'CreateDate': vol['CreateTime'].strftime("%Y-%m-%d")
+                    'CreateDate': vol['CreateTime'].strftime("%Y-%m-%d"),
+                    'Tags': tags_str
                 })
             
+            # Elastic IPs desanexados
             for addr in ec2.describe_addresses()['Addresses']:
                 if 'AssociationId' not in addr:
+                    tags_str = format_tags(addr.get('Tags', []))
                     recursos_orfãos.append({
                         'ResourceType': 'Elastic IP',
                         'Region': region,
                         'ResourceId': addr['PublicIp'],
                         'Details': f"Domain: {addr['Domain']}",
-                        'CreateDate': 'N/A'
+                        'CreateDate': 'N/A',
+                        'Tags': tags_str
                     })
         except Exception as e:
             logger.error(f"     (Acesso negado ou erro em {region}: {str(e)[:100]})")
@@ -285,16 +313,159 @@ def gerar_relatorio_3_custos(ec2_regions, logger):
     logger.info("--- 3: OTIMIZAÇÃO DE CUSTOS CONCLUÍDO ---")
     return recursos_orfãos, headers
 
+def gerar_relatorio_4_armazenamento(logger):
+    """Coleta dados de inventário de buckets S3, incluindo suas tags."""
+    logger.info("--- 4: INVENTÁRIO DE ARMAZENAMENTO (S3) ---")
+    s3_buckets = []
+
+    headers = ['BucketName', 'CreationDate', 'Region', 'PublicAccessBlock', 'PolicyIsPublic', 'Tags']
+    
+    try:
+        s3 = boto3.client('s3')
+        response = s3.list_buckets()
+        for bucket in response['Buckets']:
+            bucket_name = bucket['Name']
+            logger.info(f"  -> Verificando Bucket S3: {bucket_name}...")
+            
+            # Pega a região do bucket
+            try:
+                location = s3.get_bucket_location(Bucket=bucket_name)['LocationConstraint']
+                region = location if location else 'us-east-1'
+            except Exception:
+                region = "Acesso Negado"
+
+            # Verifica o status do Block Public Access
+            try:
+                pab = s3.get_public_access_block(Bucket=bucket_name)['PublicAccessBlockConfiguration']
+                block_status = f"BlockAll:{pab['BlockPublicAcls']}/{pab['BlockPublicPolicy']}/{pab['IgnorePublicAcls']}/{pab['RestrictPublicBuckets']}"
+            except s3.exceptions.ClientError:
+                block_status = "Não Configurado"
+            
+            # Verifica se a política torna o bucket público
+            try:
+                policy_status = s3.get_bucket_policy_status(Bucket=bucket_name)['PolicyStatus']
+                policy_is_public = 'Yes' if policy_status.get('IsPublic') else 'No'
+            except s3.exceptions.ClientError:
+                policy_is_public = "Sem Política"
+
+            tags_str = 'N/A'
+            try:
+                tag_response = s3.get_bucket_tagging(Bucket=bucket_name)
+                tags_str = format_tags(tag_response.get('TagSet', []))
+            except s3.exceptions.ClientError as e:
+                if e.response['Error']['Code'] == 'NoSuchTagSet':
+                    tags_str = 'Nenhuma Tag'
+                else:
+                    tags_str = 'Erro ao buscar tags'
+
+            s3_buckets.append({
+                'BucketName': bucket_name,
+                'CreationDate': bucket['CreationDate'].strftime("%Y-%m-%d"),
+                'Region': region,
+                'PublicAccessBlock': block_status,
+                'PolicyIsPublic': policy_is_public,
+                'Tags': tags_str
+            })
+    except Exception as e:
+        logger.error(f"     Erro crítico ao listar buckets S3: {e}")
+
+    logger.info("--- 4: INVENTÁRIO DE ARMAZENAMENTO CONCLUÍDO ---")
+    return s3_buckets, headers
+
+def gerar_relatorio_5_banco_de_dados(ec2_regions, logger):
+    """Coleta dados de inventário de instâncias RDS, incluindo suas tags."""
+    logger.info("--- 5: INVENTÁRIO DE BANCO DE DADOS (RDS) ---")
+    rds_instances = []
+ 
+    headers = ['DBInstanceIdentifier', 'Region', 'DBInstanceStatus', 'DBInstanceClass', 'Engine', 'EngineVersion', 'PubliclyAccessible', 'MultiAZ', 'StorageType', 'AllocatedStorage', 'Tags']
+    
+    for region in ec2_regions:
+        logger.info(f"  -> Verificando RDS em {region}...")
+        try:
+            rds = boto3.client('rds', region_name=region)
+            paginator = rds.get_paginator('describe_db_instances')
+            for page in paginator.paginate():
+                for instance in page['DBInstances']:
+                    tags_str = format_tags(instance.get('TagList', []))
+                    rds_instances.append({
+                        'DBInstanceIdentifier': instance['DBInstanceIdentifier'],
+                        'Region': region,
+                        'DBInstanceStatus': instance['DBInstanceStatus'],
+                        'DBInstanceClass': instance['DBInstanceClass'],
+                        'Engine': instance['Engine'],
+                        'EngineVersion': instance['EngineVersion'],
+                        'PubliclyAccessible': 'Yes' if instance['PubliclyAccessible'] else 'No',
+                        'MultiAZ': 'Yes' if instance['MultiAZ'] else 'No',
+                        'StorageType': instance['StorageType'],
+                        'AllocatedStorage': instance.get('AllocatedStorage', 'N/A'),
+                        'Tags': tags_str
+                    })
+        except Exception as e:
+            logger.error(f"     (Acesso negado ou erro em RDS {region}: {str(e)[:100]})")
+            continue
+            
+    logger.info("--- 5: INVENTÁRIO DE BANCO DE DADOS CONCLUÍDO ---")
+    return rds_instances, headers
+
+def gerar_relatorio_6_rede(ec2_regions, logger):
+    """Coleta dados de inventário de VPCs e Subnets, incluindo suas tags."""
+    logger.info("--- 6: INVENTÁRIO DE REDE (VPC) ---")
+    vpcs, subnets = [], []
+    headers_vpc = ['VpcId', 'Region', 'State', 'CidrBlock', 'IsDefault', 'Tag:Name', 'Tags']
+    headers_subnet = ['SubnetId', 'Region', 'VpcId', 'State', 'CidrBlock', 'AvailabilityZone', 'AvailableIpAddressCount', 'MapPublicIpOnLaunch', 'Tag:Name', 'Tags']
+
+    for region in ec2_regions:
+        logger.info(f"  -> Verificando VPC/Subnets em {region}...")
+        try:
+            ec2 = boto3.client('ec2', region_name=region)
+            # Coleta de VPCs
+            for vpc in ec2.describe_vpcs()['Vpcs']:
+                tags_list = vpc.get('Tags', [])
+                tags_str = format_tags(tags_list)
+                tag_name = next((tag['Value'] for tag in tags_list if tag['Key'] == 'Name'), 'N/A')
+                vpcs.append({
+                    'VpcId': vpc['VpcId'],
+                    'Region': region,
+                    'State': vpc['State'],
+                    'CidrBlock': vpc['CidrBlock'],
+                    'IsDefault': 'Yes' if vpc['IsDefault'] else 'No',
+                    'Tag:Name': tag_name,
+                    'Tags': tags_str
+                })
+            # Coleta de Subnets
+            for subnet in ec2.describe_subnets()['Subnets']:
+                tags_list = subnet.get('Tags', [])
+                tags_str = format_tags(tags_list)
+                tag_name = next((tag['Value'] for tag in tags_list if tag['Key'] == 'Name'), 'N/A')
+                subnets.append({
+                    'SubnetId': subnet['SubnetId'],
+                    'Region': region,
+                    'VpcId': subnet['VpcId'],
+                    'State': subnet['State'],
+                    'CidrBlock': subnet['CidrBlock'],
+                    'AvailabilityZone': subnet['AvailabilityZone'],
+                    'AvailableIpAddressCount': subnet['AvailableIpAddressCount'],
+                    'MapPublicIpOnLaunch': 'Yes' if subnet['MapPublicIpOnLaunch'] else 'No',
+                    'Tag:Name': tag_name,
+                    'Tags': tags_str
+                })
+        except Exception as e:
+            logger.error(f"     (Acesso negado ou erro em Rede {region}: {str(e)[:100]})")
+            continue
+
+    logger.info("--- 6: INVENTÁRIO DE REDE CONCLUÍDO ---")
+    return (vpcs, headers_vpc), (subnets, headers_subnet)
+
 # --- 4. EXECUÇÃO PRINCIPAL ---
 if __name__ == "__main__":
     today_str = datetime.now().strftime("%d%m%Y")
-    log_filename = f"inventario_aws_{today_str}.log"
-    excel_filename = f"relatorio_aws_completo_{today_str}.xlsx"
+    log_filename = f"inventario_aws_total_{today_str}.log"
+    excel_filename = f"relatorio_aws_total_{today_str}.xlsx"
     
     logger = setup_logger(log_filename)
 
     logger.info("======================================================")
-    logger.info("INICIANDO SCRIPT DE INVENTÁRIO COMPLETO DA CONTA AWS")
+    logger.info("INICIANDO SCRIPT DE INVENTÁRIO TOTAL DA CONTA AWS")
     logger.info(f"Logs sendo salvos em: {log_filename}")
     logger.info("======================================================")
 
@@ -303,7 +474,7 @@ if __name__ == "__main__":
     logger.info("Buscando listas de regiões disponíveis...")
     lista_regioes_ec2 = get_all_aws_regions('ec2', logger)
     lista_regioes_lightsail = get_all_aws_regions('lightsail', logger)
-    logger.info(f"Encontradas {len(lista_regioes_ec2)} regiões para EC2 e {len(lista_regioes_lightsail)} para Lightsail.")
+    logger.info(f"Encontradas {len(lista_regioes_ec2)} regiões para EC2/RDS/VPC e {len(lista_regioes_lightsail)} para Lightsail.")
 
     # --- Execução Pilar 1 ---
     dados_p1, headers_p1 = gerar_relatorio_1_computacao(lista_regioes_ec2, lista_regioes_lightsail, logger)
@@ -325,11 +496,32 @@ if __name__ == "__main__":
     write_to_csv('relatorio_recursos_orfãos.csv', headers_p3, dados_p3, logger)
     relatorios_para_excel['Recursos_Orfaos'] = {'data': dados_p3, 'headers': headers_p3}
     logger.info("Tabela de Recursos Órfãos:\n" + tabulate(dados_p3, headers="keys", tablefmt="grid"))
+
+    # --- Execução Pilar 4: Armazenamento ---
+    dados_p4, headers_p4 = gerar_relatorio_4_armazenamento(logger)
+    write_to_csv('relatorio_s3_buckets.csv', headers_p4, dados_p4, logger)
+    relatorios_para_excel['S3_Buckets'] = {'data': dados_p4, 'headers': headers_p4}
+    logger.info("Tabela de S3 Buckets:\n" + tabulate(dados_p4, headers="keys", tablefmt="grid"))
+    
+    # --- Execução Pilar 5: Banco de Dados ---
+    dados_p5, headers_p5 = gerar_relatorio_5_banco_de_dados(lista_regioes_ec2, logger)
+    write_to_csv('relatorio_rds_instances.csv', headers_p5, dados_p5, logger)
+    relatorios_para_excel['RDS_Instances'] = {'data': dados_p5, 'headers': headers_p5}
+    logger.info("Tabela de RDS Instances:\n" + tabulate(dados_p5, headers="keys", tablefmt="grid"))
+    
+    # --- Execução Pilar 6: Rede ---
+    (dados_p6_vpc, headers_p6_vpc), (dados_p6_subnet, headers_p6_subnet) = gerar_relatorio_6_rede(lista_regioes_ec2, logger)
+    write_to_csv('relatorio_vpcs.csv', headers_p6_vpc, dados_p6_vpc, logger)
+    write_to_csv('relatorio_subnets.csv', headers_p6_subnet, dados_p6_subnet, logger)
+    relatorios_para_excel['VPCs'] = {'data': dados_p6_vpc, 'headers': headers_p6_vpc}
+    relatorios_para_excel['Subnets'] = {'data': dados_p6_subnet, 'headers': headers_p6_subnet}
+    logger.info("Tabela de VPCs:\n" + tabulate(dados_p6_vpc, headers="keys", tablefmt="grid"))
+    logger.info("Tabela de Subnets:\n" + tabulate(dados_p6_subnet, headers="keys", tablefmt="grid"))
     
     # --- Geração do arquivo Excel consolidado ---
     logger.info("\nIniciando geração do arquivo Excel consolidado...")
     write_to_excel(excel_filename, relatorios_para_excel, logger)
 
     logger.info("======================================================")
-    logger.info("SCRIPT FINALIZADO.")
+    logger.info("SCRIPT DE INVENTÁRIO TOTAL FINALIZADO.")
     logger.info("======================================================")
