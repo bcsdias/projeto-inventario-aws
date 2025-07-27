@@ -7,5 +7,6 @@ aws/
 old/
 # Ignorar arquivos de dados e logs
 *.csv
+*.xls*
 *.log
 
