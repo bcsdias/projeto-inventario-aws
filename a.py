@@ -67,6 +67,9 @@ def write_to_excel(filename, sheets_data, logger):
             for sheet_name, data in sheets_data.items():
                 if data:
                     df = pd.DataFrame(data)
+                    # Converte colunas de data para datetime sem timezone
+                    for col in df.select_dtypes(include=['datetime64[ns, UTC]']).columns:
+                        df[col] = df[col].dt.tz_localize(None)
                     df.to_excel(writer, sheet_name=sheet_name, index=False)
                 else:
                     logger.warning(f"Nenhum dado para a aba '{sheet_name}'. Aba não será criada.")
@@ -92,11 +95,18 @@ def gerar_relatorio_1_computacao(ec2_regions, lightsail_regions, logger):
             ssm_managed_ids = {info['InstanceId'] for info in ssm.describe_instance_information()['InstanceInformationList']}
             backup_protected_arns = {res['ResourceArn'] for res in backup.list_protected_resources()['Results']}
 
+            # Primeiro, vamos obter o Account ID
+            sts = boto3.client('sts')
+            account_id = sts.get_caller_identity()['Account']
+
             response = ec2.describe_instances(Filters=[{'Name': 'instance-state-name', 'Values': ['pending', 'running', 'stopping', 'stopped']}])
             for reservation in response['Reservations']:
                 for instance in reservation['Instances']:
                     inst_id = instance['InstanceId']
                     tags = {tag['Key']: tag['Value'] for tag in instance.get('Tags', [])}
+                    
+                    # Modifique a linha que verifica o backup para usar o account_id obtido
+                    backup_arn = f'arn:aws:ec2:{region}:{account_id}:instance/{inst_id}'
                     
                     inventario.append({
                         'Serviço': 'EC2',
@@ -109,12 +119,13 @@ def gerar_relatorio_1_computacao(ec2_regions, lightsail_regions, logger):
                         'Data de Criação': instance['LaunchTime'].strftime("%Y-%m-%d"),
                         'IP Público': instance.get('PublicIpAddress', 'N/A'),
                         'Tipo de IP': "Estático (Elastic IP)" if instance.get('AssociationId') else "Dinâmico",
-                        'Backup Ativo?': 'Sim' if f'arn:aws:ec2:{region}:{instance["OwnerId"]}:instance/{inst_id}' in backup_protected_arns else 'Não',
+                        'Backup Ativo?': 'Sim' if backup_arn in backup_protected_arns else 'Não',
                         'Gerenciado por SSM?': 'Sim' if inst_id in ssm_managed_ids else 'Não',
                         'SO (Base)': instance.get('PlatformDetails', 'Linux/UNIX')
                     })
         except Exception as e:
             logger.error(f"     (Acesso negado ou erro em {region}: {str(e)[:100]}... Pulando.)")
+            logger.debug(f"     (Acesso negado ou erro em {region}: {str(e)})")
             continue
     
     for region in lightsail_regions:
@@ -290,6 +301,7 @@ if __name__ == "__main__":
     relatorios_para_excel['Computacao'] = dados_p1
     logger.info("Tabela de Computação:\n" + tabulate(dados_p1, headers="keys", tablefmt="grid"))
 
+    '''
     # --- Execução 2: ANÁLISE DE SEGURANÇA ---
     headers_p2_fw = ['Região', 'ID do Security Group', 'Nome do Security Group', 'Porta Aberta', 'Origem Aberta', 'Descrição da Regra']
     headers_p2_iam = ['Nome do Usuário', 'MFA Ativo?', 'Acesso via Console?', 'Data de Criação', 'Último Acesso (Senha)']
@@ -307,7 +319,7 @@ if __name__ == "__main__":
     write_to_csv('relatorio_recursos_orfãos.csv', headers_p3, dados_p3, logger)
     relatorios_para_excel['Recursos_Orfaos'] = dados_p3
     logger.info("Tabela de Recursos Órfãos:\n" + tabulate(dados_p3, headers="keys", tablefmt="grid"))
-    
+    '''
     # --- Geração do arquivo Excel consolidado ---
     logger.info("\nIniciando geração do arquivo Excel consolidado...")
     write_to_excel(excel_filename, relatorios_para_excel, logger)
