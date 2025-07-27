@@ -7,7 +7,7 @@ import pandas as pd
 from tabulate import tabulate
 
 # --- 1. CONFIGURAÇÃO DO LOGGER ---
-
+# (Esta seção permanece a mesma)
 def setup_logger(log_filename):
     """Configura o logger para enviar saída para o console e para um arquivo."""
     logger = logging.getLogger(__name__)
@@ -29,7 +29,7 @@ def setup_logger(log_filename):
     return logger
 
 # --- 2. FUNÇÕES AUXILIARES ---
-
+# (Estas funções permanecem as mesmas)
 def get_all_aws_regions(service_name, logger, start_region='us-east-1'):
     """Obtém uma lista de todos os nomes de regiões para um determinado serviço."""
     try:
@@ -72,39 +72,36 @@ def write_to_excel(filename, sheets_data, logger):
         logger.error(f"Erro ao escrever o arquivo Excel {filename}: {e}")
 
 def format_tags(tags_list):
-    """Formata uma lista de dicionários de tags em uma string única,
-       aceitando chaves em maiúsculo (Key/Value) ou minúsculo (key/value)."""
+    """Formata uma lista de dicionários de tags em uma string única."""
     if not tags_list:
         return 'N/A'
     
     formatted_tags = []
     for tag in tags_list:
-        # Procura por 'Key' ou 'key' e 'Value' ou 'value'
         key = tag.get('Key', tag.get('key'))
         value = tag.get('Value', tag.get('value'))
-        if key is not None: # Garante que a tag tem uma chave
+        if key is not None:
             formatted_tags.append(f"{key}={value}")
             
     return "; ".join(formatted_tags) if formatted_tags else 'N/A'
 
+
 # --- 3. FUNÇÕES DOS PILARES ---
 
-def gerar_relatorio_1_computacao(ec2_regions, lightsail_regions, logger):
-    """Coleta dados de inventário de EC2 e Lightsail e os retorna."""
-    logger.info("--- 1: INVENTÁRIO DE COMPUTAÇÃO ---")
-    inventario = []
-    
-    # Nomes das colunas padronizados com a API da AWS.
-    headers = [
-        'Service', 'Region', 'Tag:Owner', 'Tag:Name', 'InstanceId', 'State', 
-        'InstanceType', 'LaunchTime', 'PublicIpAddress', 'PrivateIpAddresses', 'Ipv6Addresses', 'IpType', 
+
+def gerar_relatorio_ec2(ec2_regions, logger):
+    """Coleta dados de inventário de instâncias EC2."""
+    logger.info("--- 1a: INVENTÁRIO DE COMPUTAÇÃO (EC2) ---")
+    inventario_ec2 = []
+    headers_ec2 = [
+        'Region', 'Tag:Name', 'InstanceId', 'State', 'InstanceType', 'VpcId', 'SubnetId',
+        'LaunchTime', 'PublicIpAddress', 'PrivateIpAddresses', 'Ipv6Addresses', 'IpType', 
         'BackupEnabled', 'IsSsmManaged', 'Tags'
     ]
     
     sts = boto3.client('sts')
     account_id = sts.get_caller_identity()['Account']
 
-    # EC2
     for region in ec2_regions:
         logger.info(f"  -> Verificando EC2 em {region}...")
         try:
@@ -119,40 +116,48 @@ def gerar_relatorio_1_computacao(ec2_regions, lightsail_regions, logger):
             for reservation in response['Reservations']:
                 for instance in reservation['Instances']:
                     inst_id = instance['InstanceId']
-                    tags = {tag['Key']: tag['Value'] for tag in instance.get('Tags', [])}
+                    tags_list = instance.get('Tags', [])
+                    instance_name = next((tag['Value'] for tag in tags_list if tag['Key'] == 'Name'), 'N/A')
                     
-                    # Coleta de múltiplos IPs privados e IPv6
                     private_ips = [ni.get('PrivateIpAddress') for ni in instance.get('NetworkInterfaces', [])]
                     ipv6_ips = []
                     for ni in instance.get('NetworkInterfaces', []):
                         ipv6_ips.extend([ipv6['Ipv6Address'] for ipv6 in ni.get('Ipv6Addresses', [])])
 
-                    tags_list = instance.get('Tags', [])
-                    tags_str = format_tags(tags_list)
-                    instance_name = next((tag['Value'] for tag in tags_list if tag['Key'] == 'Name'), 'N/A')
-
-                    inventario.append({
-                        'Service': 'EC2',
+                    inventario_ec2.append({
                         'Region': region,
-                        'Tag:Owner': tags.get('Owner', 'N/A (Tag não definida)'),
-                        'Tag:Name': tags.get('Name', 'N/A'),
+                        'Tag:Name': instance_name,
                         'InstanceId': inst_id,
                         'State': instance['State']['Name'],
                         'InstanceType': instance['InstanceType'],
+                        'VpcId': instance.get('VpcId', 'N/A'),
+                        'SubnetId': instance.get('SubnetId', 'N/A'),
                         'LaunchTime': instance['LaunchTime'].strftime("%Y-%m-%d"),
                         'PublicIpAddress': instance.get('PublicIpAddress', 'N/A'),
                         'PrivateIpAddresses': ", ".join(filter(None, private_ips)),
                         'Ipv6Addresses': ", ".join(filter(None, ipv6_ips)),
-                        'IpType': "Elastic" if instance.get('AssociationId') else "Dynamic",
+                        'IpType': "Elastic" if 'Association' in instance.get('NetworkInterfaces', [{}])[0] else "Dynamic",
                         'BackupEnabled': 'Yes' if f'arn:aws:ec2:{region}:{account_id}:instance/{inst_id}' in backup_protected_arns else 'No',
                         'IsSsmManaged': 'Yes' if inst_id in ssm_managed_ids else 'No',
-                        'Tags': tags_str
+                        'Tags': format_tags(tags_list)
                     })
         except Exception as e:
             logger.error(f"     (Acesso negado ou erro em EC2 {region}: {str(e)[:100]})")
             continue
     
-    # Lightsail
+    logger.info("--- 1a: INVENTÁRIO DE EC2 CONCLUÍDO ---")
+    return inventario_ec2, headers_ec2
+
+def gerar_relatorio_lightsail(lightsail_regions, logger):
+    """Coleta dados de inventário de instâncias Lightsail."""
+    logger.info("--- 1b: INVENTÁRIO DE COMPUTAÇÃO (Lightsail) ---")
+    inventario_lightsail = []
+    headers_lightsail = [
+        'Region', 'Name', 'Arn', 'State', 'BundleId', 'BlueprintId',
+        'CreatedAt', 'PublicIpAddress', 'PrivateIpAddress', 'Ipv6Addresses', 'IpType', 
+        'AutoSnapshotEnabled', 'Tags'
+    ]
+
     for region in lightsail_regions:
         logger.info(f"  -> Verificando Lightsail em {region}...")
         try:
@@ -160,30 +165,28 @@ def gerar_relatorio_1_computacao(ec2_regions, lightsail_regions, logger):
             ips_estaticos_map = {ip['attachedTo']: ip['name'] for ip in lightsail.get_static_ips().get('staticIps', []) if ip.get('isAttached')}
             for instance in lightsail.get_instances().get('instances', []):
                 nome_instancia = instance['name']
-                tags_str = format_tags(instance.get('tags', []))
-                inventario.append({
-                    'Service': 'Lightsail',
+                
+                inventario_lightsail.append({
                     'Region': region,
-                    'Tag:Owner': 'N/A',
-                    'Tag:Name': nome_instancia,
-                    'InstanceId': instance['arn'],
+                    'Name': nome_instancia,
+                    'Arn': instance['arn'],
                     'State': instance['state']['name'],
-                    'InstanceType': instance['bundleId'],
-                    'LaunchTime': instance['createdAt'].strftime("%Y-%m-%d"),
+                    'BundleId': instance['bundleId'],
+                    'BlueprintId': instance['blueprintId'],
+                    'CreatedAt': instance['createdAt'].strftime("%Y-%m-%d"),
                     'PublicIpAddress': instance.get('publicIpAddress', 'N/A'),
-                    'PrivateIpAddresses': instance.get('privateIpAddress', 'N/A'),
+                    'PrivateIpAddress': instance.get('privateIpAddress', 'N/A'),
                     'Ipv6Addresses': ", ".join(instance.get('ipv6Addresses', [])),
                     'IpType': "Static" if nome_instancia in ips_estaticos_map else "Dynamic",
-                    'BackupEnabled': 'Yes' if instance.get('hasAutomaticSnapshots') else 'No',
-                    'IsSsmManaged': 'N/A',
-                    'Tags': tags_str
+                    'AutoSnapshotEnabled': 'Yes' if instance.get('isStaticIp') else 'No',
+                    'Tags': format_tags(instance.get('tags', []))
                 })
         except Exception as e:
             logger.error(f"     (Acesso negado ou erro em Lightsail {region}: {str(e)[:100]})")
             continue
-
-    logger.info("--- 1: INVENTÁRIO DE COMPUTAÇÃO CONCLUÍDO ---")
-    return inventario, headers
+            
+    logger.info("--- 1b: INVENTÁRIO DE LIGHTSAIL CONCLUÍDO ---")
+    return inventario_lightsail, headers_lightsail
 
 def gerar_relatorio_2_seguranca(ec2_regions, logger):
     """Coleta dados de segurança e os retorna."""
@@ -192,7 +195,6 @@ def gerar_relatorio_2_seguranca(ec2_regions, logger):
     # Relatório de Firewalls Abertos
     logger.info("  -> Verificando Firewalls Abertos...")
     firewalls_abertos = []
-    # << CORREÇÃO >>: Cabeçalho ajustado para corresponder aos dados.
     headers_fw = ['Region', 'InstanceId', 'InstanceName', 'SecurityGroupId', 'OffendingRule', 'Source', 'InstanceTags']
     for region in ec2_regions:
         logger.info(f"  -> Verificando Firewalls e Instâncias em {region}...")
@@ -220,7 +222,6 @@ def gerar_relatorio_2_seguranca(ec2_regions, logger):
                         sg_id = sg_anexado['GroupId']
                         if sg_id in regras_abertas_map:
                             for regra in regras_abertas_map[sg_id]:
-                                # << CORREÇÃO >>: Chaves do dicionário agora correspondem ao cabeçalho.
                                 firewalls_abertos.append({
                                     'Region': region,
                                     'InstanceId': instance['InstanceId'],
@@ -476,11 +477,18 @@ if __name__ == "__main__":
     lista_regioes_lightsail = get_all_aws_regions('lightsail', logger)
     logger.info(f"Encontradas {len(lista_regioes_ec2)} regiões para EC2/RDS/VPC e {len(lista_regioes_lightsail)} para Lightsail.")
 
-    # --- Execução Pilar 1 ---
-    dados_p1, headers_p1 = gerar_relatorio_1_computacao(lista_regioes_ec2, lista_regioes_lightsail, logger)
-    write_to_csv('relatorio_computacao.csv', headers_p1, dados_p1, logger)
-    relatorios_para_excel['Computacao'] = {'data': dados_p1, 'headers': headers_p1}
-    logger.info("Tabela de Computação:\n" + tabulate(dados_p1, headers="keys", tablefmt="grid"))
+    
+    # --- Execução Pilar 1a: Computação EC2 ---
+    dados_ec2, headers_ec2 = gerar_relatorio_ec2(lista_regioes_ec2, logger)
+    write_to_csv('relatorio_ec2.csv', headers_ec2, dados_ec2, logger)
+    relatorios_para_excel['EC2_Instances'] = {'data': dados_ec2, 'headers': headers_ec2}
+    logger.info("Tabela de EC2:\n" + tabulate(dados_ec2, headers="keys", tablefmt="grid"))
+    
+    # --- Execução Pilar 1b: Computação Lightsail ---
+    dados_lightsail, headers_lightsail = gerar_relatorio_lightsail(lista_regioes_lightsail, logger)
+    write_to_csv('relatorio_lightsail.csv', headers_lightsail, dados_lightsail, logger)
+    relatorios_para_excel['Lightsail_Instances'] = {'data': dados_lightsail, 'headers': headers_lightsail}
+    logger.info("Tabela de Lightsail:\n" + tabulate(dados_lightsail, headers="keys", tablefmt="grid"))
     
     # --- Execução Pilar 2 ---
     (dados_p2_fw, headers_p2_fw), (dados_p2_iam, headers_p2_iam) = gerar_relatorio_2_seguranca(lista_regioes_ec2, logger)
@@ -517,7 +525,7 @@ if __name__ == "__main__":
     relatorios_para_excel['Subnets'] = {'data': dados_p6_subnet, 'headers': headers_p6_subnet}
     logger.info("Tabela de VPCs:\n" + tabulate(dados_p6_vpc, headers="keys", tablefmt="grid"))
     logger.info("Tabela de Subnets:\n" + tabulate(dados_p6_subnet, headers="keys", tablefmt="grid"))
-    
+
     # --- Geração do arquivo Excel consolidado ---
     logger.info("\nIniciando geração do arquivo Excel consolidado...")
     write_to_excel(excel_filename, relatorios_para_excel, logger)
