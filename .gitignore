@@ -4,6 +4,7 @@
 # Ignorar subdiretório de configs ou SDK
 aws/
 
+old/
 # Ignorar arquivos de dados e logs
 *.csv
 *.log

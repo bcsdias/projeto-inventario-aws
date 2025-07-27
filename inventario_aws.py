@@ -122,7 +122,6 @@ def gerar_relatorio_2_seguranca(ec2_regions):
     # Relatório de Firewalls Abertos
     firewalls_abertos = []
     headers_fw = ['Região', 'ID do Security Group', 'Nome do Security Group', 'Porta Aberta', 'Origem Aberta', 'Descrição da Regra']
-    # << ALTERAÇÃO AQUI: Usa a lista de regiões recebida >>
     for region in ec2_regions:
         print(f"  -> Verificando Firewalls em {region}...")
         try:
