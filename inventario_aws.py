@@ -1,3 +1,6 @@
+
+#bug 
+
 # -*- coding: utf-8 -*-
 import boto3
 import csv
@@ -90,12 +93,14 @@ def format_tags(tags_list):
 
 
 def gerar_relatorio_ec2(ec2_regions, logger):
-    """Coleta dados de inventário de instâncias EC2."""
+    """Coleta dados de inventário de instâncias EC2, incluindo recursos de hardware e regras de firewall."""
     logger.info("--- 1a: INVENTÁRIO DE COMPUTAÇÃO (EC2) ---")
     inventario_ec2 = []
     headers_ec2 = [
-        'Region', 'Tag:Name', 'InstanceId', 'State', 'InstanceType', 'VpcId', 'SubnetId',
-        'LaunchTime', 'PublicIpAddress', 'PrivateIpAddresses', 'Ipv6Addresses', 'IpType', 
+        'Region', 'Tag:Name', 'InstanceId', 'State', 'InstanceType', 
+        'VcpuCount', 'MemoryInfo(GiB)', 'RootDeviceName/Size(GiB)', # Novas colunas
+        'VpcId', 'SubnetId', 'LaunchTime', 'PublicIpAddress', 'PrivateIpAddresses', 'IpType', 
+        'SecurityGroups', 'InboundRules', 'OutboundRules', 'Ipv6Addresses',
         'BackupEnabled', 'IsSsmManaged', 'Tags'
     ]
     
@@ -111,15 +116,93 @@ def gerar_relatorio_ec2(ec2_regions, logger):
             
             ssm_managed_ids = {info['InstanceId'] for info in ssm.describe_instance_information()['InstanceInformationList']}
             backup_protected_arns = {res['ResourceArn'] for res in backup.list_protected_resources()['Results']}
+            
+            instance_types_cache = {}
+
+            # Mapeamento de Security Groups (código existente)
+            sg_rules_map = {}
+            for sg in ec2.describe_security_groups()['SecurityGroups']:
+                inbound_rules, outbound_rules = [], []
+                
+                # Regras de Entrada (Inbound)
+                for perm in sg.get('IpPermissions', []):
+                    protocol = "All" if perm.get('IpProtocol') == '-1' else perm.get('IpProtocol', 'N/A')
+                    port_info = f"Port(s): {perm.get('FromPort', 'All')}, Protocolo: {protocol}"
+                    
+                    if perm.get('IpRanges'):
+                        for ip_range in perm['IpRanges']:
+                            description = ip_range.get('Description', 'Sem descrição')
+                            inbound_rules.append(f"{port_info}, Origem: {ip_range.get('CidrIp', 'N/A')}, Descrição: {description}")
+                    if perm.get('UserIdGroupPairs'):
+                        for group in perm['UserIdGroupPairs']:
+                            description = group.get('Description', 'Sem descrição')
+                            inbound_rules.append(f"{port_info}, Origem: {group.get('GroupId', 'N/A')}, Descrição: {description}")
+
+                # Regras de Saída (Outbound)
+                for perm in sg.get('IpPermissionsEgress', []):
+                    protocol = "All" if perm.get('IpProtocol') == '-1' else perm.get('IpProtocol', 'N/A')
+                    port_info = f"Porta(s): {perm.get('FromPort', 'All')}, Protocolo: {protocol}"
+                    
+                    if perm.get('IpRanges'):
+                        for ip_range in perm['IpRanges']:
+                            description = ip_range.get('Description', 'Sem descrição')
+                            outbound_rules.append(f"{port_info}, Destino: {ip_range.get('CidrIp', 'N/A')}, Descrição: {description}")
+                    if perm.get('UserIdGroupPairs'):
+                        for group in perm['UserIdGroupPairs']:
+                            description = group.get('Description', 'Sem descrição')
+                            outbound_rules.append(f"{port_info}, Destino: {group.get('GroupId', 'N/A')}, Descrição: {description}")
+
+                sg_rules_map[sg['GroupId']] = {
+                    "inbound": "\n".join(inbound_rules) if inbound_rules else "Nenhuma",
+                    "outbound": "\n".join(outbound_rules) if outbound_rules else "Nenhuma"
+                }
 
             response = ec2.describe_instances(Filters=[{'Name': 'instance-state-name', 'Values': ['pending', 'running', 'stopping', 'stopped']}])
             for reservation in response['Reservations']:
                 for instance in reservation['Instances']:
                     inst_id = instance['InstanceId']
+                    instance_type = instance['InstanceType']
+                    
+                    if instance_type not in instance_types_cache:
+                        try:
+                            type_info = ec2.describe_instance_types(InstanceTypes=[instance_type])['InstanceTypes'][0]
+                            instance_types_cache[instance_type] = type_info
+                        except Exception as e:
+                            logger.warning(f"Não foi possível obter detalhes para o tipo de instância {instance_type}: {e}")
+                            instance_types_cache[instance_type] = {}
+                    
+                    type_details = instance_types_cache[instance_type]
+                    vcpu_count = type_details.get('VCpuInfo', {}).get('DefaultVCpus', 'N/A')
+                    memory_mib = type_details.get('MemoryInfo', {}).get('SizeInMiB', 0)
+                    memory_gib = round(memory_mib / 1024, 2) if memory_mib > 0 else 'N/A'
+                    
+                    root_device_name = instance.get('RootDeviceName', 'N/A')
+                    root_device_size = "N/A"
+                    for bd in instance.get('BlockDeviceMappings', []):
+                        if bd.get('DeviceName') == root_device_name:
+                           volume_id = bd.get('Ebs', {}).get('VolumeId')
+                           if volume_id:
+                               vol_details = ec2.describe_volumes(VolumeIds=[volume_id])['Volumes'][0]
+                               root_device_size = f"{vol_details.get('Size')} GiB"
+                    
+                    root_device_info = f"{root_device_name} ({root_device_size})"
+
                     tags_list = instance.get('Tags', [])
                     instance_name = next((tag['Value'] for tag in tags_list if tag['Key'] == 'Name'), 'N/A')
                     
                     private_ips = [ni.get('PrivateIpAddress') for ni in instance.get('NetworkInterfaces', [])]
+
+                    sg_details = [f"{sg['GroupName']}({sg['GroupId']})" for sg in instance.get('SecurityGroups', [])]
+                    sg_ids = [sg['GroupId'] for sg in instance.get('SecurityGroups', [])]
+                    
+                    all_inbound_rules = "\n---\n".join([sg_rules_map.get(sg_id, {}).get('inbound', '') for sg_id in sg_ids])
+                    all_outbound_rules = "\n---\n".join([sg_rules_map.get(sg_id, {}).get('outbound', '') for sg_id in sg_ids])
+                    
+                    net_interfaces = instance.get('NetworkInterfaces', [])
+                    ip_type = "Dynamic"
+                    if net_interfaces and 'Association' in net_interfaces[0]:
+                        ip_type = "Elastic"
+                    
                     ipv6_ips = []
                     for ni in instance.get('NetworkInterfaces', []):
                         ipv6_ips.extend([ipv6['Ipv6Address'] for ipv6 in ni.get('Ipv6Addresses', [])])
@@ -129,33 +212,40 @@ def gerar_relatorio_ec2(ec2_regions, logger):
                         'Tag:Name': instance_name,
                         'InstanceId': inst_id,
                         'State': instance['State']['Name'],
-                        'InstanceType': instance['InstanceType'],
+                        'InstanceType': instance_type,
+                        'VcpuCount': vcpu_count,
+                        'MemoryInfo(GiB)': memory_gib,
+                        'RootDeviceName/Size(GiB)': root_device_info,
                         'VpcId': instance.get('VpcId', 'N/A'),
                         'SubnetId': instance.get('SubnetId', 'N/A'),
                         'LaunchTime': instance['LaunchTime'].strftime("%Y-%m-%d"),
                         'PublicIpAddress': instance.get('PublicIpAddress', 'N/A'),
                         'PrivateIpAddresses': ", ".join(filter(None, private_ips)),
+                        'IpType': ip_type,
+                        'SecurityGroups': ",\n".join(sg_details),
+                        'InboundRules': all_inbound_rules,
+                        'OutboundRules': all_outbound_rules,
                         'Ipv6Addresses': ", ".join(filter(None, ipv6_ips)),
-                        'IpType': "Elastic" if 'Association' in instance.get('NetworkInterfaces', [{}])[0] else "Dynamic",
                         'BackupEnabled': 'Yes' if f'arn:aws:ec2:{region}:{account_id}:instance/{inst_id}' in backup_protected_arns else 'No',
                         'IsSsmManaged': 'Yes' if inst_id in ssm_managed_ids else 'No',
                         'Tags': format_tags(tags_list)
                     })
         except Exception as e:
-            logger.error(f"     (Acesso negado ou erro em EC2 {region}: {str(e)[:100]})")
+            logger.error(f"     (Acesso negado ou erro em EC2 {region}: {e})")
             continue
     
     logger.info("--- 1a: INVENTÁRIO DE EC2 CONCLUÍDO ---")
     return inventario_ec2, headers_ec2
 
 def gerar_relatorio_lightsail(lightsail_regions, logger):
-    """Coleta dados de inventário de instâncias Lightsail."""
+    """Coleta dados de inventário de instâncias Lightsail, incluindo recursos de hardware e regras de firewall."""
     logger.info("--- 1b: INVENTÁRIO DE COMPUTAÇÃO (Lightsail) ---")
     inventario_lightsail = []
     headers_lightsail = [
-        'Region', 'Name', 'Arn', 'State', 'BundleId', 'BlueprintId',
-        'CreatedAt', 'PublicIpAddress', 'PrivateIpAddress', 'Ipv6Addresses', 'IpType', 
-        'AutoSnapshotEnabled', 'Tags'
+        'Region', 'Name', 'Arn', 'State', 'BundleId', 
+        'VcpuCount', 'RamSizeInGb', 'DiskSizeInGb',
+        'BlueprintId', 'CreatedAt', 'PublicIpAddress', 'PrivateIpAddress', 'IpType', 
+        'Ipv6Addresses', 'AutoSnapshotEnabled', 'FirewallRules', 'Tags'
     ]
 
     for region in lightsail_regions:
@@ -166,19 +256,51 @@ def gerar_relatorio_lightsail(lightsail_regions, logger):
             for instance in lightsail.get_instances().get('instances', []):
                 nome_instancia = instance['name']
                 
+                firewall_rules = []
+                port_states = lightsail.get_instance_port_states(instanceName=nome_instancia)['portStates']
+                for rule in port_states:
+                    if rule.get('state') == 'open':
+                        # Formata a porta de forma inteligente
+                        from_port = rule.get('fromPort', 'All')
+                        to_port = rule.get('toPort', 'All')
+                        port_str = f"Porta: {from_port}" if from_port == to_port else f"Portas: {from_port}-{to_port}"
+
+                        # Padroniza o protocolo
+                        protocol = rule.get('protocol', 'all').upper()
+
+                        # Formata as origens (IPv4 e IPv6)
+                        cidrs = rule.get('cidrs', [])
+                        ipv6_cidrs = rule.get('ipv6Cidrs', [])
+                        all_sources = cidrs + ipv6_cidrs
+                        
+                        source_str = ", ".join(all_sources) if all_sources else "N/A"
+                        if "0.0.0.0/0" in source_str:
+                            source_str = source_str.replace("0.0.0.0/0", "Qualquer Lugar (IPv4)")
+
+                        firewall_rules.append(f"{port_str}, Protocolo: {protocol}, Origem: {source_str}")
+                
+                
+                hardware = instance.get('hardware', {})
+                disks = hardware.get('disks', [{}])
+                disk_size = disks[0].get('sizeInGb', 'N/A') if disks else 'N/A'
+
                 inventario_lightsail.append({
                     'Region': region,
                     'Name': nome_instancia,
                     'Arn': instance['arn'],
                     'State': instance['state']['name'],
                     'BundleId': instance['bundleId'],
+                    'VcpuCount': hardware.get('cpuCount', 'N/A'),
+                    'RamSizeInGb': hardware.get('ramSizeInGb', 'N/A'),
+                    'DiskSizeInGb': disk_size,
                     'BlueprintId': instance['blueprintId'],
                     'CreatedAt': instance['createdAt'].strftime("%Y-%m-%d"),
                     'PublicIpAddress': instance.get('publicIpAddress', 'N/A'),
                     'PrivateIpAddress': instance.get('privateIpAddress', 'N/A'),
-                    'Ipv6Addresses': ", ".join(instance.get('ipv6Addresses', [])),
                     'IpType': "Static" if nome_instancia in ips_estaticos_map else "Dynamic",
+                    'Ipv6Addresses': ", ".join(instance.get('ipv6Addresses', [])),
                     'AutoSnapshotEnabled': 'Yes' if instance.get('isStaticIp') else 'No',
+                    'FirewallRules': "\n".join(firewall_rules) if firewall_rules else "Nenhuma",
                     'Tags': format_tags(instance.get('tags', []))
                 })
         except Exception as e:
@@ -525,7 +647,7 @@ if __name__ == "__main__":
     relatorios_para_excel['Subnets'] = {'data': dados_p6_subnet, 'headers': headers_p6_subnet}
     logger.info("Tabela de VPCs:\n" + tabulate(dados_p6_vpc, headers="keys", tablefmt="grid"))
     logger.info("Tabela de Subnets:\n" + tabulate(dados_p6_subnet, headers="keys", tablefmt="grid"))
-
+    
     # --- Geração do arquivo Excel consolidado ---
     logger.info("\nIniciando geração do arquivo Excel consolidado...")
     write_to_excel(excel_filename, relatorios_para_excel, logger)
