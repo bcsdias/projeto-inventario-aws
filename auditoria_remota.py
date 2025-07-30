@@ -368,7 +368,7 @@ if __name__ == "__main__":
     logger = setup_logger(log_filename)
 
     logger.info("======================================================")
-    logger.info("INICIANDO SCRIPT DE AUDITORIA REMOTA DE INSTÂNCIAS")
+    logger.info("INICIANDO SCRIPT DE AUDITORIA REMOTA DE INSTÂNCIAS (EC2 & Lightsail)")
     logger.info(f"Resultados serão salvos em: {output_base_dir}")
     logger.info("======================================================")
 
@@ -382,39 +382,55 @@ if __name__ == "__main__":
             ssm = boto3.client('ssm', region_name=region)
             ec2 = boto3.client('ec2', region_name=region)
             
-            # Pega apenas instâncias gerenciadas pelo SSM
-            managed_instances = ssm.describe_instance_information()['InstanceInformationList']
-            managed_instance_ids = [inst['InstanceId'] for inst in managed_instances if inst.get('PingStatus') == 'Online']
+            managed_instances = ssm.describe_instance_information(
+                Filters=[{'Key': 'PingStatus', 'Values': ['Online']}]
+            )['InstanceInformationList']
             
-            if not managed_instance_ids:
+            if not managed_instances:
                 logger.info(f"Nenhuma instância online gerenciada pelo SSM encontrada em {region}.")
                 continue
-            else:
-                logger.info(f"{len(managed_instance_ids)} instância(s) gerenciada(s) e online encontrada(s) em {region}.")
             
-            # Pega o nome das instâncias
-            instance_details = ec2.describe_instances(InstanceIds=managed_instance_ids)
+            ec2_instance_ids = [inst['InstanceId'] for inst in managed_instances if inst['InstanceId'].startswith('i-')]
+            other_instance_ids = {inst['InstanceId']: inst for inst in managed_instances if not inst['InstanceId'].startswith('i-')}
+            
+            logger.info(f"{len(ec2_instance_ids)} instância(s) EC2 e {len(other_instance_ids)} instância(s) Lightsail/Managed encontradas em {region}.")
+
             instance_info_map = {}
-            for res in instance_details['Reservations']:
-                for inst in res['Instances']:
-                    instance_info_map[inst['InstanceId']] = {
-                        'Name': next((tag['Value'] for tag in inst.get('Tags', []) if tag['Key'] == 'Name'), inst['InstanceId']),
-                        'PlatformDetails': inst.get('PlatformDetails', 'Linux/UNIX') # Padrão para Linux se não especificado
-                    }
 
-                # Cria diretório para a instância
-                for instance_id, details in instance_info_map.items():
-                    instance_name = details['Name']
-                    platform = details['PlatformDetails']
-                    
-                    logger.info(f"Processando instância: {instance_name} ({instance_id}) - Plataforma: {platform}")
-                    platform_safe_name = platform.replace(' ', '_').replace('/', '-')
-                    instance_dir_name = f"{platform_safe_name}_{instance_name.replace(' ', '_').replace('/', '_')}_{instance_id}"
-                    instance_dir = os.path.join(output_base_dir, instance_dir_name)
-                    if not os.path.exists(instance_dir):
-                        os.makedirs(instance_dir)
+            # Processa e enriquece os dados das instâncias EC2
+            if ec2_instance_ids:
+                instance_details = ec2.describe_instances(InstanceIds=ec2_instance_ids)
+                for res in instance_details['Reservations']:
+                    for inst in res['Instances']:
+                        instance_info_map[inst['InstanceId']] = {
+                            'Name': next((tag['Value'] for tag in inst.get('Tags', []) if tag['Key'] == 'Name'), inst['InstanceId']),
+                            'PlatformDetails': inst.get('PlatformDetails', 'Linux/UNIX'),
+                            'Type': 'EC2'
+                        }
+            
+            # Processa e enriquece os dados de outras instâncias gerenciadas (Lightsail)
+            for inst_id, inst_details in other_instance_ids.items():
+                instance_info_map[inst_id] = {
+                    'Name': inst_details.get('ComputerName', inst_id),
+                    'PlatformDetails': f"{inst_details.get('PlatformName', 'Unknown')} {inst_details.get('PlatformVersion', '')}".strip(),
+                    'Type': 'Lightsail_Managed'
+                }
 
-                # Executa as auditorias
+            # Agora, itera sobre o mapa unificado e executa as auditorias
+            for instance_id, details in instance_info_map.items():
+                instance_name = details['Name']
+                platform = details['PlatformDetails']
+                
+                logger.info(f"Processando instância: {instance_name} ({instance_id}) - Plataforma: {platform}")
+
+                platform_safe_name = platform.replace(' ', '_').replace('/', '-')
+                instance_dir_name = f"{details['Type']}_{platform_safe_name}_{instance_name.replace(' ', '_').replace('/', '_')}_{instance_id}"
+                instance_dir = os.path.join(output_base_dir, instance_dir_name)
+                
+                if not os.path.exists(instance_dir):
+                    os.makedirs(instance_dir)
+
+                # Executa as auditorias (as funções de auditoria já são multi-plataforma)
                 resultado_usuarios = auditoria_usuarios(ssm, instance_id, platform, logger)
                 with open(os.path.join(instance_dir, 'usuarios_e_permissoes.txt'), 'w', encoding='utf-8') as f:
                     f.write(resultado_usuarios)
@@ -423,7 +439,7 @@ if __name__ == "__main__":
                 with open(os.path.join(instance_dir, 'tarefas_agendadas.txt'), 'w', encoding='utf-8') as f:
                     f.write(resultado_tarefas)
                 
-                resultado_web, erro_web = discovery_web(ssm, instance_id, platform, logger)
+                resultado_web, _ = discovery_web(ssm, instance_id, platform, logger)
                 with open(os.path.join(instance_dir, 'discovery_web.txt'), 'w', encoding='utf-8') as f:
                     f.write(resultado_web)
         
