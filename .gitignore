@@ -4,9 +4,13 @@
 # Ignorar subdiretório de configs ou SDK
 aws/
 
+#pastas ignoradas
 old/
+auditoria_remota_resultados*/
+inventario_por_instancia/
+
 # Ignorar arquivos de dados e logs
 *.csv
 *.xls*
 *.log
-
+*.txt

@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 import boto3
 import logging
-from datetime import datetime
+import json
+from datetime import datetime, timedelta
 import os
 
-# Nota: As funções auxiliares e de coleta de dados foram copiadas do script principal
-# para tornar este script independente.
 
 # --- 1. CONFIGURAÇÃO DO LOGGER ---
 def setup_logger(log_filename):
@@ -58,18 +57,18 @@ def format_tags(tags_list):
     return "; ".join(formatted_tags) if formatted_tags else 'N/A'
 
 # --- 3. FUNÇÕES DE COLETA DE DADOS ---
-# (Estas são as mesmas funções do script principal, copiadas para cá)
 
 def gerar_relatorio_ec2(ec2_regions, logger):
-    """Coleta dados de inventário de instâncias EC2, incluindo recursos de hardware e regras de firewall."""
+    """Coleta dados de inventário de instâncias EC2, com detalhes avançados de custo, segurança e performance."""
     logger.info("--- 1a: INVENTÁRIO DE COMPUTAÇÃO (EC2) ---")
     inventario_ec2 = []
     headers_ec2 = [
-        'Region', 'Tag:Name', 'InstanceId', 'State', 'InstanceType', 
-        'VcpuCount', 'MemoryInfo(GiB)', 'RootDeviceName/Size(GiB)', # Novas colunas
+        'Region', 'Tag:Name', 'InstanceId', 'State', 'PlatformDetails', 'InstanceType', 
+        'VcpuCount', 'MemoryInfo(GiB)', 'CPU_Avg_7d (%)', 'AttachedVolumes', # Performance & Discos
         'VpcId', 'SubnetId', 'LaunchTime', 'PublicIpAddress', 'PrivateIpAddresses', 'IpType', 
+        'IamInstanceProfile', 'IMDSv2_Enforced', # Segurança
         'SecurityGroups', 'InboundRules', 'OutboundRules', 'Ipv6Addresses',
-        'BackupEnabled', 'IsSsmManaged', 'Tags'
+        'BackupEnabled', 'IsSsmManaged', 'EstimatedMonthlyCost', 'Tags' # Custo
     ]
     
     sts = boto3.client('sts')
@@ -78,15 +77,19 @@ def gerar_relatorio_ec2(ec2_regions, logger):
     for region in ec2_regions:
         logger.info(f"  -> Verificando EC2 em {region}...")
         try:
+            # Clientes para os serviços necessários na região
             ec2 = boto3.client('ec2', region_name=region)
             ssm = boto3.client('ssm', region_name=region)
             backup = boto3.client('backup', region_name=region)
-            
+            cloudwatch = boto3.client('cloudwatch', region_name=region)
+            pricing = boto3.client('pricing', region_name='us-east-1') # API de Preços é apenas em us-east-1
+
             ssm_managed_ids = {info['InstanceId'] for info in ssm.describe_instance_information()['InstanceInformationList']}
             backup_protected_arns = {res['ResourceArn'] for res in backup.list_protected_resources()['Results']}
             
             instance_types_cache = {}
-
+            pricing_cache = {}
+            
             # Mapeamento de Security Groups (código existente)
             sg_rules_map = {}
             for sg in ec2.describe_security_groups()['SecurityGroups']:
@@ -131,6 +134,49 @@ def gerar_relatorio_ec2(ec2_regions, logger):
                     inst_id = instance['InstanceId']
                     instance_type = instance['InstanceType']
                     
+                    # Coleta de Métricas de Performance (CloudWatch)
+                    try:
+                        cw_response = cloudwatch.get_metric_statistics(
+                            Namespace='AWS/EC2',
+                            MetricName='CPUUtilization',
+                            Dimensions=[{'Name': 'InstanceId', 'Value': inst_id}],
+                            StartTime=datetime.now(datetime.UTC) - timedelta(days=7),
+                            EndTime=datetime.now(datetime.UTC),
+                            Period=86400,
+                            Statistics=['Average']
+                        )
+                        cpu_avg_7d = f"{cw_response['Datapoints'][0]['Average']:.2f}%" if cw_response['Datapoints'] else "N/A"
+                    except Exception:
+                        cpu_avg_7d = "Erro ao Coletar"
+
+                    # Estimativa de Custo Mensal
+                    if instance_type not in pricing_cache:
+                        try:
+                            price_response = pricing.get_products(
+                                ServiceCode='AmazonEC2',
+                                Filters=[
+                                    {'Type': 'TERM_MATCH', 'Field': 'instanceType', 'Value': instance_type},
+                                    {'Type': 'TERM_MATCH', 'Field': 'location', 'Value': region},
+                                    {'Type': 'TERM_MATCH', 'Field': 'operatingSystem', 'Value': 'Linux'}, # Simplificação para Linux
+                                    {'Type': 'TERM_MATCH', 'Field': 'preInstalledSw', 'Value': 'NA'},
+                                    {'Type': 'TERM_MATCH', 'Field': 'tenancy', 'Value': 'Shared'}
+                                ]
+                            )
+                            price_data = json.loads(price_response['PriceList'][0])
+                            on_demand_terms = price_data['terms']['OnDemand']
+                            price_per_hour = float(list(list(on_demand_terms.values())[0]['priceDimensions'].values())[0]['pricePerUnit']['USD'])
+                            pricing_cache[instance_type] = f"USD ${price_per_hour * 730:.2f}" # 730 horas/mês
+                        except Exception:
+                            pricing_cache[instance_type] = "N/A"
+                    estimated_cost = pricing_cache[instance_type]
+
+                    # Detalhes de todos os discos anexados
+                    attached_volumes = []
+                    for bd in instance.get('BlockDeviceMappings', []):
+                        vol_id = bd.get('Ebs', {}).get('VolumeId')
+                        if vol_id:
+                            attached_volumes.append(f"{bd.get('DeviceName')}({vol_id})")
+                    
                     if instance_type not in instance_types_cache:
                         try:
                             type_info = ec2.describe_instance_types(InstanceTypes=[instance_type])['InstanceTypes'][0]
@@ -174,28 +220,39 @@ def gerar_relatorio_ec2(ec2_regions, logger):
                     ipv6_ips = []
                     for ni in instance.get('NetworkInterfaces', []):
                         ipv6_ips.extend([ipv6['Ipv6Address'] for ipv6 in ni.get('Ipv6Addresses', [])])
+                    
+                    # Coleta de IAM Profile e status do IMDSv2
+                    iam_profile_arn = instance.get('IamInstanceProfile', {}).get('Arn', 'N/A')
+                    imds_v2_enforced = "Yes" if instance.get('MetadataOptions', {}).get('HttpTokens') == 'required' else 'No'
+
+                    platform_details = instance.get('PlatformDetails', 'N/A')
 
                     inventario_ec2.append({
                         'Region': region,
                         'Tag:Name': instance_name,
                         'InstanceId': inst_id,
                         'State': instance['State']['Name'],
+                        'PlatformDetails': platform_details,
                         'InstanceType': instance_type,
                         'VcpuCount': vcpu_count,
                         'MemoryInfo(GiB)': memory_gib,
-                        'RootDeviceName/Size(GiB)': root_device_info,
+                        'CPU_Avg_7d (%)': cpu_avg_7d,
+                        'AttachedVolumes': "; ".join(attached_volumes),
                         'VpcId': instance.get('VpcId', 'N/A'),
                         'SubnetId': instance.get('SubnetId', 'N/A'),
                         'LaunchTime': instance['LaunchTime'].strftime("%Y-%m-%d"),
                         'PublicIpAddress': instance.get('PublicIpAddress', 'N/A'),
                         'PrivateIpAddresses': ", ".join(filter(None, private_ips)),
                         'IpType': ip_type,
+                        'IamInstanceProfile': iam_profile_arn,
+                        'IMDSv2_Enforced': imds_v2_enforced,
                         'SecurityGroups': ",\n".join(sg_details),
                         'InboundRules': all_inbound_rules,
                         'OutboundRules': all_outbound_rules,
                         'Ipv6Addresses': ", ".join(filter(None, ipv6_ips)),
                         'BackupEnabled': 'Yes' if f'arn:aws:ec2:{region}:{account_id}:instance/{inst_id}' in backup_protected_arns else 'No',
                         'IsSsmManaged': 'Yes' if inst_id in ssm_managed_ids else 'No',
+                        'EstimatedMonthlyCost': estimated_cost,
                         'Tags': format_tags(tags_list)
                     })
         except Exception as e:
@@ -283,7 +340,6 @@ def gerar_relatorio_lightsail(lightsail_regions, logger):
 def gerar_fichas_individuais(dados_ec2, dados_lightsail, logger):
     """Gera um arquivo de texto detalhado para cada instância."""
     
-    # Cria o diretório de saída se ele não existir
     output_dir = "inventario_por_instancia"
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
@@ -293,7 +349,8 @@ def gerar_fichas_individuais(dados_ec2, dados_lightsail, logger):
     logger.info(f"Gerando {len(dados_ec2)} fichas para instâncias EC2...")
     for instance in dados_ec2:
         instance_id = instance['InstanceId']
-        instance_name = instance['Tag:Name'].replace(" ", "_").replace("/", "_")
+        # Limpa o nome do arquivo para evitar caracteres inválidos
+        instance_name = ''.join(c for c in instance['Tag:Name'] if c.isalnum() or c in (' ', '_')).rstrip()
         filename = os.path.join(output_dir, f"EC2_{instance_name}_{instance_id}.txt")
 
         with open(filename, 'w', encoding='utf-8') as f:
@@ -305,15 +362,20 @@ def gerar_fichas_individuais(dados_ec2, dados_lightsail, logger):
             f.write(f"  Service             : EC2\n")
             f.write(f"  Region              : {instance.get('Region')}\n")
             f.write(f"  State               : {instance.get('State')}\n")
+            f.write(f"  PlatformDetails (OS): {instance.get('PlatformDetails')}\n")
             f.write(f"  LaunchTime          : {instance.get('LaunchTime')}\n")
             f.write(f"  Tags                : {instance.get('Tags')}\n\n")
 
-            f.write(f"[ Hardware Resources ]\n")
+            f.write(f"[ Hardware & Performance ]\n")
             f.write(f"  InstanceType        : {instance.get('InstanceType')}\n")
             f.write(f"  VcpuCount           : {instance.get('VcpuCount')}\n")
             f.write(f"  MemoryInfo(GiB)     : {instance.get('MemoryInfo(GiB)')}\n")
-            f.write(f"  RootDevice          : {instance.get('RootDeviceName/Size(GiB)')}\n\n")
+            f.write(f"  CPU_Avg_7d (%)      : {instance.get('CPU_Avg_7d (%)')}\n")
+            f.write(f"  AttachedVolumes     : {instance.get('AttachedVolumes')}\n\n")
             
+            f.write(f"[ Cost ]\n")
+            f.write(f"  EstimatedMonthlyCost: {instance.get('EstimatedMonthlyCost')}\n\n")
+
             f.write(f"[ Network Configuration ]\n")
             f.write(f"  VpcId               : {instance.get('VpcId')}\n")
             f.write(f"  SubnetId            : {instance.get('SubnetId')}\n")
@@ -323,6 +385,8 @@ def gerar_fichas_individuais(dados_ec2, dados_lightsail, logger):
             f.write(f"  Ipv6Addresses       : {instance.get('Ipv6Addresses')}\n\n")
 
             f.write(f"[ Security ]\n")
+            f.write(f"  IamInstanceProfile  : {instance.get('IamInstanceProfile')}\n")
+            f.write(f"  IMDSv2_Enforced     : {instance.get('IMDSv2_Enforced')}\n")
             f.write(f"  SecurityGroups      :\n  {instance.get('SecurityGroups', '').replace(',\\n', '\\n  ')}\n\n")
             f.write(f"  InboundRules        :\n  {instance.get('InboundRules', '').replace('\\n', '\\n  ')}\n\n")
             f.write(f"  OutboundRules       :\n  {instance.get('OutboundRules', '').replace('\\n', '\\n  ')}\n\n")
@@ -331,7 +395,7 @@ def gerar_fichas_individuais(dados_ec2, dados_lightsail, logger):
             f.write(f"  IsSsmManaged        : {instance.get('IsSsmManaged')}\n")
             f.write(f"  BackupEnabled       : {instance.get('BackupEnabled')}\n")
 
-    # Processa instâncias Lightsail
+    # Processa instâncias Lightsail 
     logger.info(f"Gerando {len(dados_lightsail)} fichas para instâncias Lightsail...")
     for instance in dados_lightsail:
         instance_name_safe = instance['Name'].replace(" ", "_").replace("/", "_")
@@ -370,6 +434,35 @@ def gerar_fichas_individuais(dados_ec2, dados_lightsail, logger):
             
     logger.info("Geração de fichas individuais concluída.")
 
+def concatenar_fichas(output_dir, logger):
+    """Lê todos os arquivos .txt de um diretório e os concatena em um único arquivo."""
+    logger.info("Iniciando a concatenação das fichas individuais...")
+    try:
+        # Lista todos os arquivos .txt no diretório de saída
+        files_to_concat = sorted([f for f in os.listdir(output_dir) if f.endswith('.txt')])
+        
+        if not files_to_concat:
+            logger.warning(f"Nenhum arquivo .txt encontrado no diretório '{output_dir}' para concatenar.")
+            return
+
+        today_str = datetime.now().strftime("%d%m%Y")
+        consolidated_filename = f"inventario_consolidado_{today_str}.txt"
+
+        with open(consolidated_filename, 'w', encoding='utf-8') as outfile:
+            for i, filename in enumerate(files_to_concat):
+                filepath = os.path.join(output_dir, filename)
+                with open(filepath, 'r', encoding='utf-8') as infile:
+                    outfile.write(infile.read())
+                
+                # Adiciona um separador entre os arquivos, exceto após o último
+                if i < len(files_to_concat) - 1:
+                    outfile.write("\n\n" + "="*80 + "\n\n")
+        
+        logger.info(f"Todas as {len(files_to_concat)} fichas foram consolidadas com sucesso em: {consolidated_filename}")
+
+    except Exception as e:
+        logger.error(f"Ocorreu um erro durante a concatenação dos arquivos: {e}")
+
 # --- 5. EXECUÇÃO PRINCIPAL ---
 if __name__ == "__main__":
     today_str = datetime.now().strftime("%d%m%Y")
@@ -393,6 +486,8 @@ if __name__ == "__main__":
 
     # Gera as fichas de texto com base nos dados coletados
     gerar_fichas_individuais(dados_ec2, dados_lightsail, logger)
+    output_directory = "inventario_por_instancia"
+    concatenar_fichas(output_directory, logger)
 
     logger.info("======================================================")
     logger.info("SCRIPT FINALIZADO.")
