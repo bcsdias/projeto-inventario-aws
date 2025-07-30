@@ -21,7 +21,6 @@ def setup_logger(log_filename):
     logger.addHandler(console_handler)
     return logger
 
-# --- 2. FUNÇÕES AUXILIARES ---
 def get_all_aws_regions(service_name, logger, start_region='us-east-1'):
     """Obtém uma lista de todos os nomes de regiões para um determinado serviço."""
     try:
@@ -30,14 +29,15 @@ def get_all_aws_regions(service_name, logger, start_region='us-east-1'):
     except Exception as e:
         logger.error(f"Erro ao obter lista de regiões para {service_name}: {e}")
         return []
-
-def execute_ssm_command(ssm_client, instance_id, commands, logger, timeout=300):
+    
+# --- 2. FUNÇÕES AUXILIARES ---
+def execute_ssm_command(ssm_client, instance_id, commands, logger, document_name='AWS-RunShellScript', timeout=300):
     """Envia um comando via SSM Run Command, aguarda e retorna a saída."""
-    logger.info(f"    Executando comando na instância {instance_id}...")
+    logger.info(f"    Executando comando via {document_name} na instância {instance_id}...")
     try:
         response = ssm_client.send_command(
             InstanceIds=[instance_id],
-            DocumentName='AWS-RunShellScript',
+            DocumentName=document_name,
             Parameters={'commands': commands},
             TimeoutSeconds=timeout
         )
@@ -65,9 +65,11 @@ def execute_ssm_command(ssm_client, instance_id, commands, logger, timeout=300):
     except Exception as e:
         logger.error(f"      Falha ao executar comando SSM em {instance_id}: {e}")
         return "ERROR", str(e)
+    
+
 
 # --- 3. SCRIPT DE DISCOVERY WEB (EMBUTIDO) ---
-SCRIPT_WEB_DISCOVERY = """
+SCRIPT_WEB_DISCOVERY = r"""
 #!/bin/bash
 #
 # Script de Discovery de Aplicações Web v2.3 (Final e Corrigido)
@@ -169,11 +171,11 @@ list_wp_plugins() {
     if [ "$WP_CLI_INSTALLED" = true ]; then
         echo "  │  └─ Plugins Instalados (Status | Nome | Versão):"
         
-        while IFS=, read -r status name version; do
+        sudo -u "$web_user" wp plugin list --path="$root_dir" --fields=status,name,version --format=csv 2>/dev/null | while IFS=, read -r status name version; do
             if [ "$status" != "status" ]; then
                 printf "  │     - [%s] %s (%s)\n" "$status" "$name" "$version"
             fi
-        done < <(sudo -u "$web_user" wp plugin list --path="$root_dir" --fields=status,name,version --format=csv 2>/dev/null)
+        done
 
     else
         print_final_detail "Status" "WP-CLI não instalado. Análise de plugins pulada."
@@ -292,42 +294,69 @@ print_header "Análise Concluída"
 
 # --- 4. FUNÇÕES DE AUDITORIA ---
 
-def auditoria_usuarios(ssm_client, instance_id, logger):
-    """Lista usuários, permissões e salva em arquivo."""
-    logger.info(f"  -> Iniciando auditoria de usuários em {instance_id}...")
-    command = [
-        "echo '=== USUÁRIOS COM SHELL DE LOGIN ==='",
-        "getent passwd | grep -vE '(/sbin/nologin|/usr/sbin/nologin|/bin/false)$' | cut -d: -f1,3,6",
-        "echo; echo '=== VERIFICAÇÃO DE PERMISSÕES SUDO ==='",
-        "grep -rE '^\\s*[^#]*\\s+ALL=\\(ALL\\)' /etc/sudoers /etc/sudoers.d/ || echo 'Nenhuma permissão global de sudo encontrada.'"
-    ]
-    stdout, stderr = execute_ssm_command(ssm_client, instance_id, command, logger)
+def auditoria_usuarios(ssm_client, instance_id, platform, logger):
+    """Lista usuários e permissões, adaptando-se para Linux ou Windows."""
+    logger.info(f"  -> Iniciando auditoria de usuários em {instance_id} ({platform})...")
+    
+    if 'windows' in platform.lower():
+        document = 'AWS-RunPowerShellScript'
+        command = [
+            "Write-Host '=== USUÁRIOS LOCAIS ==='",
+            "Get-LocalUser | Select-Object Name, Enabled, LastLogon | Format-Table",
+            "Write-Host '=== MEMBROS DO GRUPO ADMINISTRATORS ==='",
+            "Get-LocalGroupMember -Group 'Administrators' | Select-Object Name, PrincipalSource | Format-Table"
+        ]
+    else: # Assume Linux para os outros
+        document = 'AWS-RunShellScript'
+        command = [
+            "echo '=== USUÁRIOS COM SHELL DE LOGIN ==='",
+            "getent passwd | grep -vE '(/sbin/nologin|/usr/sbin/nologin|/bin/false)$' | cut -d: -f1,3,6",
+            "echo; echo '=== VERIFICAÇÃO DE PERMISSÕES SUDO ==='",
+            "grep -rE '^\\s*[^#]*\\s+ALL=\\(ALL\\)' /etc/sudoers /etc/sudoers.d/ || echo 'Nenhuma permissão global de sudo encontrada.'"
+        ]
+        
+    stdout, stderr = execute_ssm_command(ssm_client, instance_id, command, logger, document_name=document)
     return stdout if not stderr else f"STDOUT:\n{stdout}\n\nSTDERR:\n{stderr}"
 
-def auditoria_cron(ssm_client, instance_id, logger):
-    """Lista tarefas cron e salva em arquivo."""
-    logger.info(f"  -> Iniciando auditoria de Cron em {instance_id}...")
-    command = [
-        "echo '=== CRONTAB SISTEMA (/etc/crontab) ==='",
-        "cat /etc/crontab",
-        "echo; echo '=== CRON DROP-INS (/etc/cron.d/*) ==='",
-        "for f in /etc/cron.d/*; do echo \"--- Conteúdo de $f ---\"; cat \"$f\"; done",
-        "echo; echo '=== CRONTABS DE USUÁRIOS ==='",
-        "for user in $(getent passwd | cut -d: -f1); do output=$(crontab -u $user -l 2>/dev/null); if [ -n \"$output\" ]; then echo \"--- Crontab para $user ---\"; echo \"$output\"; fi; done"
-    ]
-    stdout, stderr = execute_ssm_command(ssm_client, instance_id, command, logger)
+def auditoria_cron(ssm_client, instance_id, platform, logger):
+    """Lista tarefas agendadas (cron para Linux, Scheduled Tasks para Windows)."""
+    logger.info(f"  -> Iniciando auditoria de tarefas agendadas em {instance_id} ({platform})...")
+
+    if 'windows' in platform.lower():
+        document = 'AWS-RunPowerShellScript'
+        command = [
+            "Write-Host '=== TAREFAS AGENDADAS (ATIVAS) ==='",
+            "Get-ScheduledTask | Where-Object { $_.State -ne 'Disabled' } | Select-Object TaskName, TaskPath, State, LastRunTime | Format-Table"
+        ]
+    else: # Assume Linux
+        document = 'AWS-RunShellScript'
+        command = [
+            "echo '=== CRONTAB SISTEMA (/etc/crontab) ==='",
+            "cat /etc/crontab 2>/dev/null || echo 'Arquivo não encontrado.'",
+            "echo; echo '=== CRON DROP-INS (/etc/cron.d/*) ==='",
+            "for f in /etc/cron.d/*; do if [ -f \"$f\" ]; then echo \"--- Conteúdo de $f ---\"; cat \"$f\"; fi; done",
+            "echo; echo '=== CRONTABS DE USUÁRIOS ==='",
+            "for user in $(getent passwd | cut -d: -f1); do output=$(crontab -u $user -l 2>/dev/null); if [ -n \"$output\" ]; then echo \"--- Crontab para $user ---\"; echo \"$output\"; fi; done"
+        ]
+
+    stdout, stderr = execute_ssm_command(ssm_client, instance_id, command, logger, document_name=document)
     return stdout if not stderr else f"STDOUT:\n{stdout}\n\nSTDERR:\n{stderr}"
 
-def discovery_web(ssm_client, instance_id, logger):
-    """Executa o script de discovery web e salva em arquivo."""
-    logger.info(f"  -> Iniciando discovery de aplicações web em {instance_id}...")
-    # ATENÇÃO: Cole seu script bash completo na variável SCRIPT_WEB_DISCOVERY acima
+def discovery_web(ssm_client, instance_id, platform, logger):
+    """Executa o script de discovery web (apenas para Linux)."""
+    logger.info(f"  -> Iniciando discovery de aplicações web em {instance_id} ({platform})...")
+    
+    if 'windows' in platform.lower():
+        logger.info("      Discovery web pulado: script é para ambiente Linux.")
+        return "N/A (Script não aplicável para Windows)", ""
+
     if "Cole o seu script bash completo aqui" in SCRIPT_WEB_DISCOVERY:
         logger.error("      ERRO: O script de discovery web não foi inserido na variável SCRIPT_WEB_DISCOVERY.")
-        return "ERRO", "Script de discovery não configurado na variável SCRIPT_WEB_DISCOVERY."
+        return "ERRO: Script de discovery não configurado.", ""
         
     stdout, stderr = execute_ssm_command(ssm_client, instance_id, [SCRIPT_WEB_DISCOVERY], logger)
-    return stdout if not stderr else f"STDOUT:\n{stdout}\n\nSTDERR:\n{stderr}"
+    return stdout if not stderr else f"STDOUT:\n{stdout}\n\nSTDERR:\n{stderr}", stderr
+
 
 
 # --- 5. EXECUÇÃO PRINCIPAL ---
@@ -360,33 +389,41 @@ if __name__ == "__main__":
             if not managed_instance_ids:
                 logger.info(f"Nenhuma instância online gerenciada pelo SSM encontrada em {region}.")
                 continue
+            else:
+                logger.info(f"{len(managed_instance_ids)} instância(s) gerenciada(s) e online encontrada(s) em {region}.")
             
             # Pega o nome das instâncias
             instance_details = ec2.describe_instances(InstanceIds=managed_instance_ids)
-            instance_name_map = {}
+            instance_info_map = {}
             for res in instance_details['Reservations']:
                 for inst in res['Instances']:
-                    instance_name_map[inst['InstanceId']] = next((tag['Value'] for tag in inst.get('Tags', []) if tag['Key'] == 'Name'), inst['InstanceId'])
-
-            for instance_id in managed_instance_ids:
-                instance_name = instance_name_map.get(instance_id, instance_id)
-                logger.info(f"Processando instância: {instance_name} ({instance_id})")
+                    instance_info_map[inst['InstanceId']] = {
+                        'Name': next((tag['Value'] for tag in inst.get('Tags', []) if tag['Key'] == 'Name'), inst['InstanceId']),
+                        'PlatformDetails': inst.get('PlatformDetails', 'Linux/UNIX') # Padrão para Linux se não especificado
+                    }
 
                 # Cria diretório para a instância
-                instance_dir = os.path.join(output_base_dir, f"{instance_name}_{instance_id}")
-                if not os.path.exists(instance_dir):
-                    os.makedirs(instance_dir)
+                for instance_id, details in instance_info_map.items():
+                    instance_name = details['Name']
+                    platform = details['PlatformDetails']
+                    
+                    logger.info(f"Processando instância: {instance_name} ({instance_id}) - Plataforma: {platform}")
+                    platform_safe_name = platform.replace(' ', '_').replace('/', '-')
+                    instance_dir_name = f"{platform_safe_name}_{instance_name.replace(' ', '_').replace('/', '_')}_{instance_id}"
+                    instance_dir = os.path.join(output_base_dir, instance_dir_name)
+                    if not os.path.exists(instance_dir):
+                        os.makedirs(instance_dir)
 
                 # Executa as auditorias
-                resultado_usuarios = auditoria_usuarios(ssm, instance_id, logger)
+                resultado_usuarios = auditoria_usuarios(ssm, instance_id, platform, logger)
                 with open(os.path.join(instance_dir, 'usuarios_e_permissoes.txt'), 'w', encoding='utf-8') as f:
                     f.write(resultado_usuarios)
 
-                resultado_cron = auditoria_cron(ssm, instance_id, logger)
-                with open(os.path.join(instance_dir, 'tarefas_cron.txt'), 'w', encoding='utf-8') as f:
-                    f.write(resultado_cron)
+                resultado_tarefas = auditoria_cron(ssm, instance_id, platform, logger)
+                with open(os.path.join(instance_dir, 'tarefas_agendadas.txt'), 'w', encoding='utf-8') as f:
+                    f.write(resultado_tarefas)
                 
-                resultado_web = discovery_web(ssm, instance_id, logger)
+                resultado_web, erro_web = discovery_web(ssm, instance_id, platform, logger)
                 with open(os.path.join(instance_dir, 'discovery_web.txt'), 'w', encoding='utf-8') as f:
                     f.write(resultado_web)
         
