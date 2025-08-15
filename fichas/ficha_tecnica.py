@@ -4,7 +4,7 @@ import logging
 import json
 from datetime import datetime, timedelta
 import os
-
+import time
 
 # --- 1. CONFIGURAÇÃO DO LOGGER ---
 def setup_logger(log_filename):
@@ -56,6 +56,54 @@ def format_tags(tags_list):
             
     return "; ".join(formatted_tags) if formatted_tags else 'N/A'
 
+def coletar_historico_comandos_ssm(ssm_client, instance_id, logger):
+    """
+    Executa um comando via SSM para coletar o .bash_history de todos os usuários.
+    """
+    logger.info(f"      -> Coletando histórico de comandos para {instance_id} via SSM...")
+    
+    # Comando para ler o histórico do root e de todos os usuários em /home
+    command_to_run = """
+echo "--- History for root ---"
+if [ -f /root/.bash_history ]; then cat /root/.bash_history; else echo "Not found or no permission."; fi
+for user_home in /home/*; do
+    if [ -d "$user_home" ]; then
+        username=$(basename "$user_home")
+        history_file="$user_home/.bash_history"
+        if [ -f "$history_file" ]; then
+            echo ""
+            echo "--- History for $username ---"
+            cat "$history_file"
+        fi
+    fi
+done
+"""
+    try:
+        response = ssm_client.send_command(
+            InstanceIds=[instance_id],
+            DocumentName='AWS-RunShellScript',
+            Parameters={'commands': [command_to_run]},
+            TimeoutSeconds=300
+        )
+        command_id = response['Command']['CommandId']
+
+        # Espera o comando completar
+        for _ in range(20): # Tenta por até 100 segundos
+            time.sleep(5)
+            result = ssm_client.get_command_invocation(CommandId=command_id, InstanceId=instance_id)
+            status = result['Status']
+            if status in ['Success', 'Failed', 'TimedOut', 'Cancelled']:
+                break
+        
+        if status == 'Success':
+            return result.get('StandardOutputContent', 'Saída vazia.')
+        else:
+            return f"Erro ao executar comando SSM. Status: {status}\nErro: {result.get('StandardErrorContent', 'N/A')}"
+
+    except Exception as e:
+        logger.error(f"      -> Falha ao enviar comando SSM para {instance_id}: {e}")
+        return "Falha ao executar o comando SSM."
+    
 # --- 3. FUNÇÕES DE COLETA DE DADOS ---
 
 def gerar_relatorio_ec2(ec2_regions, logger):
@@ -66,7 +114,7 @@ def gerar_relatorio_ec2(ec2_regions, logger):
         'Region', 'Tag:Name', 'InstanceId', 'State', 'PlatformDetails', 'InstanceType', 
         'VcpuCount', 'MemoryInfo(GiB)', 'CPU_Avg_7d (%)', 'AttachedVolumes', # Performance & Discos
         'VpcId', 'SubnetId', 'LaunchTime', 'PublicIpAddress', 'PrivateIpAddresses', 'IpType', 
-        'IamInstanceProfile', 'IMDSv2_Enforced', # Segurança
+        'IamInstanceProfile', 'IMDSv2_Enforced', 'CommandHistory', # Segurança e Auditoria
         'SecurityGroups', 'InboundRules', 'OutboundRules', 'Ipv6Addresses',
         'BackupEnabled', 'IsSsmManaged', 'EstimatedMonthlyCost', 'Tags' # Custo
     ]
@@ -227,6 +275,14 @@ def gerar_relatorio_ec2(ec2_regions, logger):
 
                     platform_details = instance.get('PlatformDetails', 'N/A')
 
+                    # Coleta do histórico de comandos via SSM
+                    command_history = "Instância não gerenciada pelo SSM."
+                    if inst_id in ssm_managed_ids:
+                        command_history = coletar_historico_comandos_ssm(ssm, inst_id, logger)
+                    else:
+                        logger.info(f"      -> Instância {inst_id} não é gerenciada pelo SSM. Pulando coleta de histórico.")
+
+
                     inventario_ec2.append({
                         'Region': region,
                         'Tag:Name': instance_name,
@@ -253,6 +309,7 @@ def gerar_relatorio_ec2(ec2_regions, logger):
                         'BackupEnabled': 'Yes' if f'arn:aws:ec2:{region}:{account_id}:instance/{inst_id}' in backup_protected_arns else 'No',
                         'IsSsmManaged': 'Yes' if inst_id in ssm_managed_ids else 'No',
                         'EstimatedMonthlyCost': estimated_cost,
+                        'CommandHistory': command_history,
                         'Tags': format_tags(tags_list)
                     })
         except Exception as e:
@@ -394,6 +451,12 @@ def gerar_fichas_individuais(dados_ec2, dados_lightsail, logger):
             f.write(f"[ Management & Backup ]\n")
             f.write(f"  IsSsmManaged        : {instance.get('IsSsmManaged')}\n")
             f.write(f"  BackupEnabled       : {instance.get('BackupEnabled')}\n")
+
+            f.write(f"\n[ User Command History (from .bash_history) ]\n")
+            # Indenta o histórico para melhor legibilidade
+            history_content = instance.get('CommandHistory', 'N/A').strip()
+            indented_history = "\n".join([f"  {line}" for line in history_content.splitlines()])
+            f.write(f"{indented_history}\n")
 
     # Processa instâncias Lightsail 
     logger.info(f"Gerando {len(dados_lightsail)} fichas para instâncias Lightsail...")
