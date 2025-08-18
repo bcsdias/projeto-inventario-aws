@@ -14,7 +14,7 @@
 # 3. Execute com privilégios de superusuário: sudo ./collect_history.sh
 # ==============================================================================
 
-OUTPUT_FILE="collected_history_$(hostname)_$(date +%F).log"
+OUTPUT_FILE="historico_comandos_$(hostname)_$(date +%F).log"
 
 echo "Iniciando a coleta do histórico de comandos em $(hostname)..."
 echo "Resultados serão salvos em: $OUTPUT_FILE"
@@ -22,6 +22,10 @@ echo "Resultados serão salvos em: $OUTPUT_FILE"
 # Limpa ou cria o arquivo de saída
 echo "Coleta de Histórico - Servidor: $(hostname) - Data: $(date)" > "$OUTPUT_FILE"
 echo "===========================================================" >> "$OUTPUT_FILE"
+
+echo "=======================================================================" >> "$OUTPUT_FILE"
+echo " 4. Historico de comandos para cada usuario local                      " >> "$OUTPUT_FILE"
+echo "=======================================================================" >> "$OUTPUT_FILE"
 
 # Coleta do histórico do root e de todos os usuários em /home
 echo -e "\n--- Histórico para o usuário: root ---" >> "$OUTPUT_FILE"
