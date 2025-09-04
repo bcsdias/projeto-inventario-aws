@@ -279,16 +279,16 @@ echo "Data da Execução: $(date)"
 echo ""
 
 # --- 1. AUDITORIA DE USUÁRIOS E PERMISSÕES ---
-auditoria_usuarios_permissoes
-echo
+#auditoria_usuarios_permissoes
+#echo
 
 # --- 2. AUDITORIA DE TAREFAS AGENDADAS (CRON) ---
-auditoria_cron
-echo
+#auditoria_cron
+#echo
 
 # --- 3. DISCOVERY DE APLICAÇÕES WEB ---
-discovery_web
-echo
+#discovery_web
+#echo
 
 # --- 4. AUDITORIA DE HISTÓRICO DE COMANDOS ---
 auditoria_historico_comandos
