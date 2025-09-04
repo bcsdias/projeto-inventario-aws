@@ -1,12 +1,13 @@
 #!/bin/bash
 #
 # ===================================================================
-# Script de Auditoria Completa v1.0
+# Script de Auditoria Completa v1.1
 #
 # Executa uma auditoria completa em um servidor Linux, verificando:
 # 1. Usuários locais e permissões de sudo.
 # 2. Tarefas agendadas (cron do sistema e de usuários).
 # 3. Discovery detalhado de aplicações web (Nginx/Apache).
+# 4. Comandos executados recentemente e histórico de comandos.
 # ===================================================================
 
 # --- Configuração e Funções Auxiliares ---
@@ -189,6 +190,87 @@ scan_web_server_configs() {
     done
 }
 
+# --- 1. FUNÇÃO DE AUDITORIA DE USUÁRIOS E PERMISSÕES ---
+
+auditoria_usuarios_permissoes() {
+    print_header "1. Análise de Usuários e Permissões"
+    echo
+    echo ">> USUÁRIOS COM SHELL DE LOGIN (Usuário:UID:Home)"
+    getent passwd | grep -vE '(/sbin/nologin|/usr/sbin/nologin|/bin/false)$' | cut -d: -f1,3,6
+    echo
+    echo ">> VERIFICAÇÃO DE PERMISSÕES SUDO GLOBAIS"
+    # A flag -r é para recursivo, -E para expressão regular estendida
+    # O || é executado se o grep não encontrar nada (exit code 1)
+    grep -rE '^\s*[^#]*\s+ALL=\(ALL\)' /etc/sudoers /etc/sudoers.d/ || echo "Nenhuma permissão global de sudo (ALL=ALL) encontrada."
+    echo
+}
+
+# --- 2. FUNÇÃO DE AUDITORIA DE TAREFAS AGENDADAS (CRON) ---
+
+auditoria_cron() {
+    print_header "2. Análise de Tarefas Agendadas (Cron)"
+    echo
+    echo ">> CRONTAB DO SISTEMA (/etc/crontab)"
+    cat /etc/crontab 2>/dev/null || echo "Arquivo /etc/crontab não encontrado."
+    echo
+    echo ">> CRON DROP-INS (/etc/cron.d/)"
+    for f in /etc/cron.d/*; do
+      if [ -f "$f" ]; then
+        echo "--- Conteúdo de $f ---"
+        cat "$f"
+        echo
+      fi
+    done
+    echo ">> CRONTABS DE USUÁRIOS"
+    for user in $(getent passwd | cut -d: -f1); do
+      # O crontab -l retorna um erro se o usuário não tiver crontab, então redirecionamos o stderr
+      output=$(crontab -u "$user" -l 2>/dev/null)
+      if [ -n "$output" ]; then
+        echo "--- Crontab para $user ---"
+        echo "$output"
+        echo
+      fi
+    done
+}
+
+# --- 3. FUNÇÃO DE DISCOVERY DE APLICAÇÕES WEB ---
+
+discovery_web() {
+    print_header "3. Análise de Aplicações Web"
+    # Detecta o servidor web em execução
+    if pgrep -x "nginx" > /dev/null; then
+        print_subheader "Servidor Web Detectado: Nginx"
+        scan_web_server_configs "Nginx" "/etc/nginx/sites-enabled" "*"
+    elif pgrep -x "apache2" > /dev/null || pgrep -x "httpd" > /dev/null; then
+        print_subheader "Servidor Web Detectado: Apache"
+        scan_web_server_configs "Apache" "/etc/apache2/sites-enabled" "*.conf"
+    fi
+}
+
+# --- 4. FUNÇÃO DE AUDITORIA DE HISTÓRICO DE COMANDOS ---
+
+auditoria_historico_comandos() {
+    print_header "4. Análise do Histórico de Comandos"
+    echo
+    echo ">> COLETANDO HISTÓRICO DE COMANDOS DOS USUÁRIOS COM SHELL"
+    echo
+
+    # Itera sobre todos os usuários que não possuem 'nologin' ou 'false' como shell
+    getent passwd | grep -vE 'nologin|false' | cut -d: -f1,6 | while IFS=: read -r user homedir; do
+      if [ -d "$homedir" ]; then
+        # Verifica os arquivos de histórico .bash_history e .zsh_history
+        for history_file in "$homedir/.bash_history" "$homedir/.zsh_history"; do
+            if [ -f "$history_file" ] && [ -r "$history_file" ]; then
+                # Imprime um cabeçalho para o usuário e o tipo de shell
+                printf "--- Histórico para Usuário: %s (Shell: %s) ---\n" "$user" "$(basename "$history_file")"
+                # Imprime o conteúdo do arquivo de histórico, indentado
+                sed 's/^/    /' "$history_file"
+                echo "" # Adiciona uma linha em branco para separação
+            fi
+        done
+      fi
+    done
+}
 
 # --- Início da Execução Principal ---
 
@@ -197,65 +279,20 @@ echo "Data da Execução: $(date)"
 echo ""
 
 # --- 1. AUDITORIA DE USUÁRIOS E PERMISSÕES ---
-print_header "1. Análise de Usuários e Permissões"
-echo
-echo ">> USUÁRIOS COM SHELL DE LOGIN (Usuário:UID:Home)"
-getent passwd | grep -vE '(/sbin/nologin|/usr/sbin/nologin|/bin/false)$' | cut -d: -f1,3,6
-echo
-echo ">> VERIFICAÇÃO DE PERMISSÕES SUDO GLOBAIS"
-grep -rE '^\s*[^#]*\s+ALL=\(ALL\)' /etc/sudoers /etc/sudoers.d/ || echo "Nenhuma permissão global de sudo (ALL=ALL) encontrada."
-echo
+auditoria_usuarios_permissoes
 echo
 
 # --- 2. AUDITORIA DE TAREFAS AGENDADAS (CRON) ---
-print_header "2. Análise de Tarefas Agendadas (Cron)"
-echo
-echo ">> CRONTAB DO SISTEMA (/etc/crontab)"
-cat /etc/crontab 2>/dev/null || echo "Arquivo /etc/crontab não encontrado."
-echo
-echo ">> CRON DROP-INS (/etc/cron.d/)"
-for f in /etc/cron.d/*; do
-  if [ -f "$f" ]; then
-    echo "--- Conteúdo de $f ---"
-    cat "$f"
-    echo
-  fi
-done
-echo ">> CRONTABS DE USUÁRIOS"
-for user in $(getent passwd | cut -d: -f1); do
-  output=$(crontab -u "$user" -l 2>/dev/null)
-  if [ -n "$output" ]; then
-    echo "--- Crontab para $user ---"
-    echo "$output"
-    echo
-  fi
-done
+auditoria_cron
 echo
 
 # --- 3. DISCOVERY DE APLICAÇÕES WEB ---
-print_header "3. Análise de Aplicações Web"
-echo
-if [ "$WP_CLI_INSTALLED" = true ]; then
-    echo "Status: WP-CLI detectado. A análise de plugins será realizada."
-else
-    echo "Status: WP-CLI não encontrado. A análise de plugins será pulada."
-fi
+discovery_web
 echo
 
-# Detecta o servidor web em execução
-if pgrep -x "nginx" > /dev/null; then
-    print_subheader "Servidor Web Detectado: Nginx"
-    scan_web_server_configs "Nginx" "/etc/nginx/sites-enabled" "*"
-elif pgrep -x "apache2" > /dev/null || pgrep -x "httpd" > /dev/null; then
-    print_subheader "Servidor Web Detectado: Apache"
-    if [ -d "/etc/apache2/sites-enabled" ]; then
-        scan_web_server_configs "Apache" "/etc/apache2/sites-enabled" "*.conf"
-    elif [ -d "/etc/httpd/conf.d" ]; then # Para CentOS/RHEL
-        scan_web_server_configs "Apache" "/etc/httpd/conf.d" "*.conf"
-    fi
-else
-    echo "Nenhum servidor web (Nginx ou Apache) parece estar em execução."
-fi
+# --- 4. AUDITORIA DE HISTÓRICO DE COMANDOS ---
+auditoria_historico_comandos
 echo
+
 
 print_header "AUDITORIA COMPLETA CONCLUÍDA"
